@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment and Secrets
+.env
+.env.*
+.sentinel.json
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Project-specific scratch and temporary files
+scratch.ts
+AGENTS.md
+index.html
+calculator.html
+test/index.html
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
