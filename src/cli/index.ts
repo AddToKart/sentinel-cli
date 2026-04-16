@@ -13,7 +13,7 @@ import { AVAILABLE_MODELS } from './core/models.js';
 import { safePrompt, ensureApiKey } from './core/auth.js';
 import { confirmTool, confirmYesNo } from './core/tool-confirmation.js';
 import { composeSystemPrompt, injectMentionedContextWithMetadata, readProjectContext } from './core/context.js';
-import { G, G_LIGHT } from './ui/theme.js';
+import { COLORS, THEME } from './ui/theme.js';
 import { buildStatusBar, renderMarkdown, renderWelcome, startSpinner, streamText } from './ui/rendering.js';
 import { smartInput } from './ui/smart-input.js';
 import { createTurnInterruptController } from './core/request-interrupt.js';
@@ -244,25 +244,25 @@ export async function startChat(providerName?: string, modelName?: string) {
         const toolMsgs = messages.filter(m => m.role === 'tool').length;
         const totalChars = messages.reduce((s, m) => s + m.content.length, 0);
         const approx = Math.round(totalChars / 4);
-        console.log(chalk.cyan('\n  ┌─ Session Stats ─────────────────'));
-        console.log(chalk.dim('  │ ') + chalk.white('Provider: ') + chalk.cyan(currentProvider));
-        console.log(chalk.dim('  │ ') + chalk.white('Model:    ') + chalk.cyan(currentModel));
-        console.log(chalk.dim('  │ ') + chalk.white('Messages: ') + chalk.yellow(`${msgCount}`) + chalk.dim(` (${userMsgs} user, ${assistantMsgs} assistant, ${toolMsgs} tool)`));
-        console.log(chalk.dim('  │ ') + chalk.white('Context:  ') + chalk.yellow(`~${approx.toLocaleString()} tokens`) + chalk.dim(` (${(totalChars / 1024).toFixed(1)} KB)`));
-        console.log(chalk.dim('  │ ') + chalk.white('Planning: ') + chalk.yellow(planningMode));
-        console.log(chalk.dim('  │ ') + chalk.white('Mode:     ') + chalk.yellow(continuity.getMode()));
-        console.log(chalk.dim('  │ ') + chalk.white('Focus:    ') + chalk.yellow(String(continuity.getFocusedFiles().length)) + chalk.dim(' tracked files'));
-        console.log(chalk.cyan('  └──────────────────────────────────\n'));
+        console.log(THEME.border('\n  ╭─ Session Stats ─────────────────'));
+        console.log(THEME.border('  │ ') + THEME.body('Provider: ') + chalk.hex(COLORS.green300)(currentProvider));
+        console.log(THEME.border('  │ ') + THEME.body('Model:    ') + chalk.hex(COLORS.green300)(currentModel));
+        console.log(THEME.border('  │ ') + THEME.body('Messages: ') + chalk.hex(COLORS.green400)(`${msgCount}`) + THEME.dim(` (${userMsgs} user, ${assistantMsgs} assistant, ${toolMsgs} tool)`));
+        console.log(THEME.border('  │ ') + THEME.body('Context:  ') + chalk.hex(COLORS.green400)(`~${approx.toLocaleString()} tokens`) + THEME.dim(` (${(totalChars / 1024).toFixed(1)} KB)`));
+        console.log(THEME.border('  │ ') + THEME.body('Planning: ') + chalk.hex(COLORS.green400)(planningMode));
+        console.log(THEME.border('  │ ') + THEME.body('Mode:     ') + chalk.hex(COLORS.green400)(continuity.getMode()));
+        console.log(THEME.border('  │ ') + THEME.body('Focus:    ') + chalk.hex(COLORS.green400)(String(continuity.getFocusedFiles().length)) + THEME.dim(' tracked files'));
+        console.log(THEME.border('  ╰──────────────────────────────────\n'));
         continue;
       }
 
       if (command === '/tools') {
-        console.log(chalk.cyan('\n  ┌─ Available Tools ────────────────'));
+        console.log(THEME.border('\n  ╭─ Available Tools ────────────────'));
         for (const t of tools) {
-          const icon = t.requiresConfirmation ? chalk.yellow('⚠') : chalk.hex(G)('◆');
-          console.log(chalk.dim('  │ ') + icon + ' ' + chalk.bold.white(t.name) + chalk.dim(` — ${t.description.slice(0, 60)}...`));
+          const icon = t.requiresConfirmation ? chalk.hex(COLORS.green400)('⚠') : THEME.icon('◈');
+          console.log(THEME.border('  │ ') + icon + ' ' + THEME.body(t.name) + THEME.dim(` — ${t.description.slice(0, 60)}...`));
         }
-        console.log(chalk.cyan('  └──────────────────────────────────\n'));
+        console.log(THEME.border('  ╰──────────────────────────────────\n'));
         continue;
       }
 
@@ -333,7 +333,7 @@ export async function startChat(providerName?: string, modelName?: string) {
       }
 
       if (command === '/help') {
-        console.log(chalk.cyan('\n  ┌─ Sentinel Commands ──────────────'));
+        console.log(THEME.border('\n  ╭─ Sentinel Commands ──────────────'));
         const cmds = [
           ['/models',   'Switch AI model and provider'],
           ['/tools',    'List all available agent tools'],
@@ -346,12 +346,12 @@ export async function startChat(providerName?: string, modelName?: string) {
           ['/exit',     'Close Sentinel'],
         ];
         for (const [cmd, desc] of cmds) {
-          console.log(chalk.dim('  │ ') + chalk.cyan.bold((cmd ?? '').padEnd(10)) + chalk.white(desc));
+          console.log(THEME.border('  │ ') + THEME.accent((cmd ?? '').padEnd(10)) + THEME.body(desc));
         }
-        console.log(chalk.dim('  │'));
-        console.log(chalk.dim('  │ ') + chalk.white.bold('File mentions'));
-        console.log(chalk.dim('  │ ') + chalk.dim('Type ') + chalk.cyan('@') + chalk.dim(' to browse files, or just name a file (e.g. ') + chalk.cyan('calculator.html') + chalk.dim(')'));
-        console.log(chalk.cyan('  └──────────────────────────────────\n'));
+        console.log(THEME.border('  │'));
+        console.log(THEME.border('  │ ') + THEME.header('File mentions'));
+        console.log(THEME.border('  │ ') + THEME.dim('Type ') + THEME.accent('@') + THEME.dim(' to browse files, or just name a file (e.g. ') + THEME.accent('calculator.html') + THEME.dim(')'));
+        console.log(THEME.border('  ╰──────────────────────────────────\n'));
         continue;
       }
 
@@ -381,7 +381,7 @@ export async function startChat(providerName?: string, modelName?: string) {
       if (accepted) {
         const plan = await runPlanningPass(provider, messages, taskInput);
         if (plan.trim()) {
-          process.stdout.write('\n' + chalk.hex(G)('◆') + ' ' + chalk.bold.hex(G_LIGHT)('Plan') + chalk.dim(' ›') + '\n');
+          process.stdout.write('\n' + THEME.icon('◈ ') + chalk.bold.hex(COLORS.green300)('Plan') + THEME.dim(' ›') + '\n');
           await streamText(renderMarkdown(plan));
           process.stdout.write('\n');
           memory.addSummary('plan', plan);
@@ -494,7 +494,7 @@ export async function startChat(providerName?: string, modelName?: string) {
         response = await runSelfCritiqueIfNeeded(provider, messages, response, taskInput);
 
         if (response.content) {
-          process.stdout.write('\n' + chalk.hex(G)('◆') + ' ' + chalk.bold.hex(G_LIGHT)('Sentinel') + chalk.dim(' ›') + '\n');
+          process.stdout.write('\n' + THEME.icon('◈ ') + THEME.header('Sentinel') + THEME.dim(` ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`) + '\n');
           await streamText(renderMarkdown(response.content));
           process.stdout.write('\n');
           memory.addSummary('assistant', response.content);
@@ -620,7 +620,7 @@ export async function startChat(providerName?: string, modelName?: string) {
               }
             }
 
-            process.stdout.write('\n' + chalk.cyan('  ┌') + chalk.cyan.bold(` ${displayName} `) + chalk.dim(label) + '\n');
+            process.stdout.write('\n' + THEME.border('╭─ ') + THEME.header(`[Tool] ${displayName} `) + THEME.dim(label) + '\n');
             const stopToolSpinner = startSpinner(`${displayName}...`);
             try {
               const result = await tool.execute(call.args);
@@ -629,14 +629,14 @@ export async function startChat(providerName?: string, modelName?: string) {
               const lines = result.split('\n');
               const previewLines = lines.slice(0, 12);
               for (const line of previewLines) {
-                if (line.startsWith('+ ')) process.stdout.write(chalk.green('  │ ' + line) + '\n');
-                else if (line.startsWith('- ')) process.stdout.write(chalk.red('  │ ' + line) + '\n');
-                else process.stdout.write(chalk.dim('  │ ') + chalk.white(line) + '\n');
+                if (line.startsWith('+ ')) process.stdout.write(THEME.border('│ ') + chalk.hex(COLORS.green400)(line) + '\n');
+                else if (line.startsWith('- ')) process.stdout.write(THEME.border('│ ') + chalk.hex(COLORS.slate600)(line) + '\n');
+                else process.stdout.write(THEME.border('│ ') + THEME.body(line) + '\n');
               }
               if (lines.length > 12) {
-                process.stdout.write(chalk.dim(`  │ ... (${lines.length - 12} more lines)`) + '\n');
+                process.stdout.write(THEME.border('│ ') + THEME.dim(`... (${lines.length - 12} more lines)`) + '\n');
               }
-              process.stdout.write(chalk.cyan('  └') + chalk.green(' ✔ done') + '\n\n');
+              process.stdout.write(THEME.border('╰─') + chalk.hex(COLORS.green400)(' ✔ done') + '\n\n');
               messages.push({ role: 'tool', content: result, name: call.name, tool_call_id: call.id });
               memory.addToolResult(call.name, call.args, result);
               continuity.onToolResult(call.name, call.args, result);
@@ -650,7 +650,7 @@ export async function startChat(providerName?: string, modelName?: string) {
               producedOutputThisTurn = true;
             } catch (toolErr: any) {
               stopToolSpinner();
-              process.stdout.write(chalk.cyan('  └') + chalk.red(` ✖ ${toolErr.message}`) + '\n\n');
+              process.stdout.write(THEME.border('╰─') + chalk.hex(COLORS.slate600)(` ✖ ${toolErr.message}`) + '\n\n');
               const errResult = `Error: ${toolErr.message}`;
               messages.push({ role: 'tool', content: errResult, name: call.name, tool_call_id: call.id });
               memory.addToolResult(call.name, call.args, errResult);
@@ -680,7 +680,7 @@ export async function startChat(providerName?: string, modelName?: string) {
 program
   .command('chat')
   .description('Start an interactive chat session')
-  .option('-p, --provider <provider>', 'LLM provider (gemini, openai, anthropic, openrouter)')
+  .option('-p, --provider <provider>', 'LLM provider (gemini, openrouter)')
   .option('-m, --model <model>', 'Model name to use')
   .action(async (options) => {
     await startChat(options.provider, options.model);
@@ -737,7 +737,7 @@ export async function runOnce(prompt: string, providerName?: string, modelName?:
   if (isHeavyTask(prompt)) {
     const plan = await runPlanningPass(provider, baseMessages, prompt);
     if (plan.trim()) {
-      process.stdout.write('\n' + chalk.hex(G)('◆') + ' ' + chalk.bold.hex(G_LIGHT)('Plan') + chalk.dim(' ›') + '\n');
+      process.stdout.write('\n' + THEME.icon('◈ ') + chalk.bold.hex(COLORS.green300)('Plan') + THEME.dim(' ›') + '\n');
       await streamText(renderMarkdown(plan));
       process.stdout.write('\n');
       memory.addSummary('plan', plan);
@@ -851,10 +851,10 @@ export async function runOnce(prompt: string, providerName?: string, modelName?:
         }
         const tool = tools.find(t => t.name === call.name);
         if (tool) {
-          process.stdout.write(chalk.cyan(`\n  ┌ ${tool.displayName || tool.name} `) + chalk.dim(tool.getLabel ? tool.getLabel(call.args) : '') + '\n');
+          process.stdout.write('\n' + THEME.border('╭─ ') + THEME.header(`[Tool] ${tool.displayName || tool.name} `) + THEME.dim(tool.getLabel ? tool.getLabel(call.args) : '') + '\n');
           try {
             const result = await tool.execute(call.args);
-            process.stdout.write(chalk.cyan('  └') + chalk.green(' ✔ done\n'));
+            process.stdout.write(THEME.border('╰─') + chalk.hex(COLORS.green400)(' ✔ done\n'));
             messages.push({ role: 'tool', content: result, name: call.name, tool_call_id: call.id });
             memory.addToolResult(call.name, call.args, result);
             continuity.onToolResult(call.name, call.args, result);

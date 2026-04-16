@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import chalk from 'chalk';
-import { G_LIGHT } from '../ui/theme.js';
+import { COLORS, THEME } from '../ui/theme.js';
 import { SYSTEM_PROMPT } from './system-prompt.js';
 
 const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
@@ -67,7 +67,7 @@ export async function injectMentionedContextWithMetadata(input: string): Promise
       try {
         const content = fs.readFileSync(fullPath, 'utf-8');
         const ext = path.extname(mentionedPath).slice(1) || 'text';
-        process.stdout.write(chalk.dim(` 📄 Auto-loaded: `) + chalk.hex(G_LIGHT)(mentionedPath) + chalk.dim(` (${content.split('\n').length} lines)\n`));
+        process.stdout.write(chalk.dim(` 📄 Auto-loaded: `) + THEME.accent(mentionedPath) + chalk.dim(` (${content.split('\n').length} lines)\n`));
         injections.push(`--- File: ${mentionedPath} ---\n\`\`\`${ext}\n${content}\n\`\`\`\n---`);
         loadedFiles.push(fullPath);
       } catch { /* skip unreadable */ }
@@ -86,7 +86,7 @@ export async function injectMentionedContextWithMetadata(input: string): Promise
       try {
         const content = fs.readFileSync(fullPath, 'utf-8');
         const ext = path.extname(mentionedPath).slice(1) || 'text';
-        process.stdout.write(chalk.dim(` 📄 Auto-loaded: `) + chalk.hex(G_LIGHT)(mentionedPath) + chalk.dim(` (${content.split('\n').length} lines)\n`));
+        process.stdout.write(chalk.dim(` 📄 Auto-loaded: `) + THEME.accent(mentionedPath) + chalk.dim(` (${content.split('\n').length} lines)\n`));
         injections.push(`--- File: ${mentionedPath} ---\n\`\`\`${ext}\n${content}\n\`\`\`\n---`);
         loadedFiles.push(fullPath);
       } catch { /* skip unreadable */ }

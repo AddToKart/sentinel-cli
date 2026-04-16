@@ -1,7 +1,7 @@
 import chalk from 'chalk';
 import readline from 'readline';
 import path from 'path';
-import { G } from '../ui/theme.js';
+import { COLORS, THEME } from '../ui/theme.js';
 
 const alwaysAllowKeys = new Set<string>();
 
@@ -26,7 +26,7 @@ export async function confirmTool(tool: any, args: any): Promise<boolean> {
   const summary = tool.getRiskSummary ? tool.getRiskSummary(args) : (tool.getLabel ? tool.getLabel(args) : tool.name);
   process.stdout.write('\n' + chalk.yellow('  ⚠') + chalk.yellow.bold(' Confirmation required') + '\n');
   process.stdout.write(chalk.dim('  Action: ') + chalk.white(summary) + '\n');
-  process.stdout.write(chalk.dim('  Allow? ') + chalk.hex(G)('[y]') + chalk.dim('es / ') + chalk.red('[n]') + chalk.dim('o / ') + chalk.hex(G)('[a]') + chalk.dim('lways : '));
+  process.stdout.write(chalk.dim('  Allow? ') + THEME.accent('[y]') + chalk.dim('es / ') + chalk.red('[n]') + chalk.dim('o / ') + THEME.accent('[a]') + chalk.dim('lways : '));
 
   return new Promise<boolean>((resolve) => {
     readline.emitKeypressEvents(process.stdin);
@@ -39,7 +39,7 @@ export async function confirmTool(tool: any, args: any): Promise<boolean> {
         if (ch === 'a') {
           alwaysAllowKeys.add(approvalKey);
         }
-        process.stdout.write(ch === 'n' ? chalk.red('no') + '\n\n' : chalk.hex(G)(ch === 'a' ? 'always' : 'yes') + '\n\n');
+        process.stdout.write(ch === 'n' ? chalk.red('no') + '\n\n' : THEME.accent(ch === 'a' ? 'always' : 'yes') + '\n\n');
         resolve(ch !== 'n');
       }
       if (key.ctrl && key.name === 'c') {

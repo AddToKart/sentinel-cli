@@ -2,13 +2,15 @@ import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
 import chalk from 'chalk';
-import { G } from './theme.js';
+import figures from 'figures';
+import { COLORS, THEME } from './theme.js';
 import { highlightMentions } from './rendering.js';
 
 const inputHistory: string[] = [];
 let historyIdx = -1;
 let historyTempBuf = '';
 
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', '.cache', 'coverage']);
 const SLASH_COMMANDS = [
   '/help',
@@ -24,22 +26,52 @@ const SLASH_COMMANDS = [
   '/quit',
 ];
 
+function stripAnsi(text: string): string {
+  return text.replace(ANSI_RE, '');
+}
+
+function visibleLength(text: string): number {
+  return stripAnsi(text).length;
+}
+
+function truncateLeft(text: string, max: number): string {
+  if (max <= 0) return '';
+  if (text.length <= max) return text;
+  if (max === 1) return '…';
+  return `…${text.slice(text.length - max + 1)}`;
+}
+
+function truncateRight(text: string, max: number): string {
+  if (max <= 0) return '';
+  if (text.length <= max) return text;
+  if (max === 1) return '…';
+  return `${text.slice(0, max - 1)}…`;
+}
+
 function getProjectFiles(): string[] {
   const results: string[] = [];
+
   function walk(dir: string, prefix = '') {
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
     for (const entry of entries) {
       if (IGNORE_DIRS.has(entry.name)) continue;
+
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
-        results.push(rel + '/');
+        results.push(`${rel}/`);
         walk(path.join(dir, entry.name), rel);
       } else {
         results.push(rel);
       }
     }
   }
+
   walk(process.cwd());
   return results;
 }
@@ -53,137 +85,161 @@ export async function smartInput(statusLines?: string[]): Promise<string> {
     let mentionFiltered: string[] = [];
     let commandSelectedIdx = 0;
     let commandFiltered: string[] = [];
-    const STATUS_LINES = statusLines?.length ?? 0;
+    let lastTopOffset = 0;
+    let hasRendered = false;
+
     const allFiles = getProjectFiles();
-    const PLACEHOLDER = chalk.dim('Type your message, @path/to/file, or /command…');
-    const PREFIX = chalk.hex(G)(' ❯ ');
+    const placeholder = THEME.dim('Type your message, @path/to/file, or /command...');
 
     readline.emitKeypressEvents(process.stdin);
 
+    function clearRender() {
+      if (hasRendered && lastTopOffset > 0) {
+        process.stdout.write(`\x1b[${lastTopOffset}A`);
+      }
+      process.stdout.write('\r\x1b[J');
+      hasRendered = false;
+      lastTopOffset = 0;
+    }
+
     function filterFiles() {
-      const q = mentionQuery.toLowerCase();
-      mentionFiltered = allFiles.filter(f => !q || f.toLowerCase().includes(q)).slice(0, 9);
+      const query = mentionQuery.toLowerCase();
+      mentionFiltered = allFiles
+        .filter((file) => !query || file.toLowerCase().includes(query))
+        .slice(0, 6);
       mentionSelectedIdx = Math.min(mentionSelectedIdx, Math.max(0, mentionFiltered.length - 1));
     }
 
     function updateCommandSuggestions() {
-      const trimmed = buf.trimStart();
+      const trimmed = buf.trimStart().toLowerCase();
       if (!/^\/[^\s]*$/.test(trimmed)) {
         commandFiltered = [];
         commandSelectedIdx = 0;
         return;
       }
-      const token = trimmed.toLowerCase();
-      commandFiltered = token === '/'
+
+      const directMatches = trimmed === '/'
         ? SLASH_COMMANDS.slice()
-        : SLASH_COMMANDS.filter(cmd => cmd.startsWith(token));
-      if (commandFiltered.length === 0 && token.length > 1) {
-        commandFiltered = SLASH_COMMANDS.filter(cmd => cmd.includes(token.slice(1)));
-      }
+        : SLASH_COMMANDS.filter((cmd) => cmd.startsWith(trimmed));
+      const fallbackMatches = directMatches.length === 0 && trimmed.length > 1
+        ? SLASH_COMMANDS.filter((cmd) => cmd.includes(trimmed.slice(1)))
+        : [];
+
+      commandFiltered = (directMatches.length > 0 ? directMatches : fallbackMatches).slice(0, 6);
       commandSelectedIdx = Math.min(commandSelectedIdx, Math.max(0, commandFiltered.length - 1));
     }
 
-    function isCommandSuggesting(): boolean {
-      updateCommandSuggestions();
-      return commandFiltered.length > 0;
+    function applyCommandSuggestion(): boolean {
+      const selected = commandFiltered[commandSelectedIdx];
+      if (!selected) return false;
+
+      const trimmed = buf.trimStart();
+      const leading = buf.slice(0, buf.length - trimmed.length);
+      const nextValue = `${leading}${selected}`;
+      if (nextValue === buf) return false;
+
+      buf = nextValue;
+      commandFiltered = [];
+      commandSelectedIdx = 0;
+      return true;
     }
 
-    function applyCommandSuggestion(submit: boolean): boolean {
-      if (!isCommandSuggesting()) return false;
-      const selected = commandFiltered[commandSelectedIdx] ?? commandFiltered[0];
-      if (!selected) return false;
-      const trimmed = buf.trimStart();
-      const leadingSpaces = buf.slice(0, buf.length - trimmed.length);
-      const nextValue = leadingSpaces + selected;
-      if (submit) {
-        if (nextValue.trim() && nextValue !== inputHistory[inputHistory.length - 1]) {
-          inputHistory.push(nextValue);
-        }
-        historyIdx = -1;
-        historyTempBuf = '';
-        done(nextValue);
-      } else {
-        buf = nextValue;
-      }
+    function applyMentionSuggestion(): boolean {
+      const selected = mentionFiltered[mentionSelectedIdx];
+      if (!selected || mentionStart < 0) return false;
+
+      buf = `${buf.slice(0, mentionStart)}@${selected}${selected.endsWith('/') ? '' : ' '}`;
+      mentionStart = -1;
+      mentionQuery = '';
+      mentionFiltered = [];
+      mentionSelectedIdx = 0;
       return true;
     }
 
     function render() {
       updateCommandSuggestions();
+
+      const width = Math.max(54, process.stdout.columns || 80);
+      const promptPrefix = `${THEME.border('│')} ${THEME.accent(figures.pointerSmall)} `;
+      const promptWidth = Math.max(12, width - visibleLength(promptPrefix) - 3);
+      const preview = buf ? truncateLeft(buf, promptWidth) : '';
+      const display = buf ? THEME.userText(highlightMentions(preview)) : placeholder;
+      const cursorColumn = visibleLength(promptPrefix) + visibleLength(preview);
       const showCommandSuggestions = commandFiltered.length > 0;
       const showMentionSuggestions = !showCommandSuggestions && mentionStart >= 0 && mentionFiltered.length > 0;
+      const lines: string[] = [];
 
-      process.stdout.write('\x1b[?25l');
-      process.stdout.write('\r\x1b[J');
-      process.stdout.write(PREFIX);
-      if (buf) {
-        process.stdout.write(highlightMentions(buf));
-      } else {
-        process.stdout.write(PLACEHOLDER);
+      if (statusLines && statusLines.length > 0) {
+        lines.push(...statusLines);
       }
 
-      let targetColumn = PREFIX.replace(/\x1B\[[0-9;]*m/gi, '').length + buf.length;
-      if (!buf) {
-        targetColumn = PREFIX.replace(/\x1B\[[0-9;]*m/gi, '').length;
-      }
+      lines.push(THEME.border(`╭${'─'.repeat(Math.max(0, width - 2))}╮`));
+      lines.push(`${promptPrefix}${display}`);
+      lines.push(THEME.border(`╰${'─'.repeat(Math.max(0, width - 2))}╯`));
+      lines.push(THEME.dim(`  ${figures.arrowUp}/${figures.arrowDown} history  Tab autocomplete  Enter submit  Esc dismiss`));
 
-      let linesPrinted = 0;
       if (showCommandSuggestions) {
+        const suggestionWidth = Math.max(16, width - 12);
         for (let i = 0; i < commandFiltered.length; i++) {
           const cmd = commandFiltered[i] ?? '';
-          if (!cmd) continue;
-          const isSelected = i === commandSelectedIdx;
-          const label = isSelected
-            ? chalk.bgHex('#1a2a3a')(chalk.cyan.bold(' ❯ ') + chalk.cyan(cmd))
-            : chalk.dim('   ' + cmd);
-          process.stdout.write('\n\r\x1b[K' + chalk.hex(G)('⌘') + ' ' + label);
-          linesPrinted++;
+          const selected = i === commandSelectedIdx;
+          const label = truncateRight(cmd, suggestionWidth);
+          const line = selected
+            ? chalk.bgHex(COLORS.slate800)(`${THEME.accent(` ${figures.play} `)}${chalk.hex(COLORS.slate100)(label)}`)
+            : THEME.dim(`   ${label}`);
+          lines.push(`${THEME.dim(' ⌘ ')}${line}`);
         }
       } else if (showMentionSuggestions) {
+        const suggestionWidth = Math.max(16, width - 14);
         for (let i = 0; i < mentionFiltered.length; i++) {
-          const f = mentionFiltered[i] ?? '';
-          if (!f) continue;
-          const isSelected = i === mentionSelectedIdx;
-          const isDir = f.endsWith('/');
-          const icon = isDir ? chalk.yellow('📁') : chalk.dim('📄');
-          const label = isSelected
-            ? chalk.bgHex('#1a2a3a')(chalk.cyan.bold(' ❯ ') + chalk.cyan(f))
-            : chalk.dim('   ' + f);
-          process.stdout.write('\n\r\x1b[K' + icon + ' ' + label);
-          linesPrinted++;
+          const file = mentionFiltered[i] ?? '';
+          const selected = i === mentionSelectedIdx;
+          const icon = file.endsWith('/') ? chalk.yellow('dir') : THEME.dim('file');
+          const label = truncateRight(file, suggestionWidth);
+          const line = selected
+            ? chalk.bgHex(COLORS.slate800)(`${THEME.accent(` ${figures.play} `)}${chalk.hex(COLORS.slate100)(label)}`)
+            : THEME.dim(`   ${label}`);
+          lines.push(` ${icon} ${line}`);
         }
       }
 
-      if (statusLines) {
-        for (const line of statusLines) {
-          process.stdout.write('\n\r\x1b[K' + line);
-          linesPrinted++;
-        }
+      const inputRowIndex = (statusLines?.length ?? 0) + 1;
+      const rowsBelowInput = lines.length - 1 - inputRowIndex;
+
+      process.stdout.write('\x1b[?25l');
+      clearRender();
+      process.stdout.write(lines.join('\n\r'));
+
+      if (rowsBelowInput > 0) {
+        process.stdout.write(`\x1b[${rowsBelowInput}A`);
       }
 
-      if (linesPrinted > 0) {
-        process.stdout.write(`\x1b[${linesPrinted}A`);
-      }
       process.stdout.write('\r');
-      if (targetColumn > 0) {
-        process.stdout.write(`\x1b[${targetColumn}C`);
+      if (cursorColumn > 0) {
+        process.stdout.write(`\x1b[${cursorColumn}C`);
       }
       process.stdout.write('\x1b[?25h');
+
+      hasRendered = true;
+      lastTopOffset = inputRowIndex;
     }
 
     function done(value: string) {
-      process.stdout.write('\r\x1b[J');
-      if (value.trim()) {
-        process.stdout.write(
-          chalk.blue.bold('User') + chalk.dim(' › ') + highlightMentions(value)
-        );
-      }
+      process.stdout.write('\x1b[?25h');
+      clearRender();
       process.stdin.removeListener('keypress', keypressHandler);
-      process.stdout.write('\n');
+
+      if (value.trim()) {
+        const width = Math.max(54, process.stdout.columns || 80);
+        const echoed = truncateRight(value, Math.max(12, width - 12));
+        process.stdout.write(
+          `${THEME.icon('◆ ')}${THEME.header('You')}${THEME.dim(' › ')}${THEME.userText(highlightMentions(echoed))}\n`
+        );
+        process.stdout.write(`${THEME.border('─'.repeat(width))}\n`);
+      }
+
       resolve(value);
     }
-
-    render();
 
     const keypressHandler = (_str: string, key: any) => {
       if (!key) return;
@@ -195,21 +251,20 @@ export async function smartInput(statusLines?: string[]): Promise<string> {
       }
 
       if (key.name === 'return' || key.name === 'enter') {
-        if (isCommandSuggesting()) {
-          if (applyCommandSuggestion(true)) return;
-        }
-        if (mentionStart >= 0 && mentionFiltered.length > 0) {
-          const sel = mentionFiltered[mentionSelectedIdx] ?? '';
-          buf = buf.slice(0, mentionStart) + '@' + sel + (sel.endsWith('/') ? '' : ' ');
-          mentionStart = -1;
-          mentionQuery = '';
-          mentionFiltered = [];
+        if (commandFiltered.length > 0 && applyCommandSuggestion()) {
           render();
           return;
         }
+
+        if (mentionStart >= 0 && mentionFiltered.length > 0 && applyMentionSuggestion()) {
+          render();
+          return;
+        }
+
         if (buf.trim() && buf !== inputHistory[inputHistory.length - 1]) {
           inputHistory.push(buf);
         }
+
         historyIdx = -1;
         historyTempBuf = '';
         done(buf);
@@ -217,18 +272,12 @@ export async function smartInput(statusLines?: string[]): Promise<string> {
       }
 
       if (key.name === 'tab') {
-        if (isCommandSuggesting()) {
-          if (applyCommandSuggestion(false)) {
-            render();
-            return;
-          }
+        if (commandFiltered.length > 0 && applyCommandSuggestion()) {
+          render();
+          return;
         }
-        if (mentionStart >= 0 && mentionFiltered.length > 0) {
-          const sel = mentionFiltered[mentionSelectedIdx] ?? '';
-          buf = buf.slice(0, mentionStart) + '@' + sel + (sel.endsWith('/') ? '' : ' ');
-          mentionStart = -1;
-          mentionQuery = '';
-          mentionFiltered = [];
+
+        if (mentionStart >= 0 && mentionFiltered.length > 0 && applyMentionSuggestion()) {
           render();
         }
         return;
@@ -238,6 +287,7 @@ export async function smartInput(statusLines?: string[]): Promise<string> {
         mentionStart = -1;
         mentionQuery = '';
         mentionFiltered = [];
+        mentionSelectedIdx = 0;
         commandFiltered = [];
         commandSelectedIdx = 0;
         render();
@@ -245,76 +295,82 @@ export async function smartInput(statusLines?: string[]): Promise<string> {
       }
 
       if (key.name === 'up') {
-        if (isCommandSuggesting()) {
+        if (commandFiltered.length > 0) {
           commandSelectedIdx = commandSelectedIdx > 0 ? commandSelectedIdx - 1 : commandFiltered.length - 1;
-          render();
         } else if (mentionStart >= 0 && mentionFiltered.length > 0) {
           mentionSelectedIdx = mentionSelectedIdx > 0 ? mentionSelectedIdx - 1 : mentionFiltered.length - 1;
-          render();
         } else if (inputHistory.length > 0) {
-          if (historyIdx === -1) { historyTempBuf = buf; historyIdx = inputHistory.length - 1; }
-          else if (historyIdx > 0) { historyIdx--; }
+          if (historyIdx === -1) {
+            historyTempBuf = buf;
+            historyIdx = inputHistory.length - 1;
+          } else if (historyIdx > 0) {
+            historyIdx -= 1;
+          }
           buf = inputHistory[historyIdx] ?? buf;
-          render();
         }
+        render();
         return;
       }
 
       if (key.name === 'down') {
-        if (isCommandSuggesting()) {
+        if (commandFiltered.length > 0) {
           commandSelectedIdx = commandSelectedIdx < commandFiltered.length - 1 ? commandSelectedIdx + 1 : 0;
-          render();
         } else if (mentionStart >= 0 && mentionFiltered.length > 0) {
           mentionSelectedIdx = mentionSelectedIdx < mentionFiltered.length - 1 ? mentionSelectedIdx + 1 : 0;
-          render();
         } else if (historyIdx !== -1) {
-          historyIdx++;
-          if (historyIdx >= inputHistory.length) { historyIdx = -1; buf = historyTempBuf; }
-          else { buf = inputHistory[historyIdx] ?? buf; }
-          render();
+          historyIdx += 1;
+          if (historyIdx >= inputHistory.length) {
+            historyIdx = -1;
+            buf = historyTempBuf;
+          } else {
+            buf = inputHistory[historyIdx] ?? buf;
+          }
         }
+        render();
         return;
       }
 
       if (key.name === 'backspace') {
-        if (buf.length > 0) {
-          buf = buf.slice(0, -1);
-          if (mentionStart >= 0) {
-            if (buf.length <= mentionStart || buf[mentionStart] !== '@') {
-              mentionStart = -1;
-              mentionQuery = '';
-              mentionFiltered = [];
-            } else {
-              mentionQuery = buf.slice(mentionStart + 1);
-              filterFiles();
-            }
+        if (buf.length === 0) return;
+
+        buf = buf.slice(0, -1);
+        if (mentionStart >= 0) {
+          if (buf.length <= mentionStart || buf[mentionStart] !== '@') {
+            mentionStart = -1;
+            mentionQuery = '';
+            mentionFiltered = [];
+          } else {
+            mentionQuery = buf.slice(mentionStart + 1);
+            filterFiles();
           }
-          render();
         }
+        render();
         return;
       }
 
       const ch: string = _str ?? '';
-      if (ch && ch.length === 1 && !key.ctrl && !key.meta) {
-        buf += ch;
-        if (ch === '@') {
-          mentionStart = buf.length - 1;
+      if (!ch || ch.length !== 1 || key.ctrl || key.meta) return;
+
+      buf += ch;
+      if (ch === '@') {
+        mentionStart = buf.length - 1;
+        mentionQuery = '';
+        filterFiles();
+      } else if (mentionStart >= 0) {
+        if (ch === ' ') {
+          mentionStart = -1;
           mentionQuery = '';
+          mentionFiltered = [];
+        } else {
+          mentionQuery = buf.slice(mentionStart + 1);
           filterFiles();
-        } else if (mentionStart >= 0) {
-            if (ch === ' ') {
-              mentionStart = -1;
-              mentionQuery = '';
-              mentionFiltered = [];
-            } else {
-              mentionQuery = buf.slice(mentionStart + 1);
-              filterFiles();
-          }
         }
-        render();
       }
+
+      render();
     };
 
     process.stdin.on('keypress', keypressHandler);
+    render();
   });
 }
