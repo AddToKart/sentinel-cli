@@ -27,6 +27,7 @@ import {
   prepareExecutionTurn,
   runPlanningPass,
 } from './core/turn-executor.js';
+import { checkForUpdate, performUpdate } from './core/updater.js';
 
 export const program = new Command();
 
@@ -243,6 +244,7 @@ function showHelp() {
     ['/planning', 'Planning mode (auto|on|off)'],
     ['/save',     'Export session to markdown file'],
     ['/init',     'Generate a SENTINEL.md project file'],
+    ['/update',   'Check for and install updates'],
     ['/clear',    'Clear conversation history'],
     ['/exit',     'Close Sentinel'],
   ];
@@ -346,6 +348,11 @@ async function handleSlashCommand(
     return { handled: true, currentProvider, currentModel, planningMode, messages };
   }
 
+  if (command === '/update') {
+    await performUpdate();
+    return { handled: true, currentProvider, currentModel, planningMode, messages };
+  }
+
   console.log(chalk.yellow(`\n ⚠ Unknown command: ${command}. Type /help for a list.\n`));
   return { handled: true, currentProvider, currentModel, planningMode, messages };
 }
@@ -367,6 +374,13 @@ export async function startChat(providerName?: string, modelName?: string) {
   if (projectContext) {
     process.stdout.write(chalk.dim(' 📋 Loaded SENTINEL.md project context\n\n'));
   }
+
+  // Silent update check
+  checkForUpdate().then(({ updateAvailable, latest }) => {
+    if (updateAvailable) {
+      console.log(chalk.yellow(`\n ${figures.warning} Update available! ${chalk.bold(latest)} is out. Type ${chalk.cyan('/update')} to install.\n`));
+    }
+  }).catch(() => {});
 
   const fullSystemPrompt = composeSystemPrompt(projectContext, '--- Project Context (from SENTINEL.md) ---');
   let messages: Message[] = upsertRuntimeIdentityContext(

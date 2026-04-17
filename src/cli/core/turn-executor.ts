@@ -520,6 +520,10 @@ export async function executeHarnessTurn(options: TurnExecutionOptions): Promise
       }
 
       if (!response || ((!response.content || !response.content.trim()) && (!response.toolCalls || response.toolCalls.length === 0))) {
+        // Log the raw response for debugging in case of instability
+        if (response) {
+          console.debug('[Sentinel] Empty response received from provider:', JSON.stringify(response, null, 2));
+        }
         io.showNoResponse();
         popLastUserIfPending(messages);
         break;

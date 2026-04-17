@@ -1,5 +1,5 @@
 {
-  "name": "sentinel-cli",
+  "name": "sentinel-cli-k",
   "version": "1.0.0",
   "description": "Sentinel CLI - Professional Agent Harness",
   "type": "module",
@@ -7,14 +7,23 @@
   "bin": {
     "sentinel": "dist/index.js"
   },
+  "author": "AddToKart",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AddToKart/sentinel-cli.git"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc",
+    "prepublishOnly": "npm run build",
     "test": "node --import ./test/register-ts-node.mjs test/run.ts"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "@inquirer/core": "^11.1.8",
