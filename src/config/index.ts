@@ -11,7 +11,7 @@ const configSchema = z.object({
   ANTHROPIC_API_KEY: z.string().optional(),
   OPENROUTER_API_KEY: z.string().optional(),
   OLLAMA_HOST: z.string().default('http://localhost:11434'),
-  DEFAULT_PROVIDER: z.enum(['gemini', 'openai', 'anthropic', 'openrouter', 'ollama']).default('gemini'),
+  DEFAULT_PROVIDER: z.enum(['gemini', 'openrouter']).default('gemini'),
   GEMINI_MODEL: z.string().default('gemini-1.5-pro'),
   OPENAI_MODEL: z.string().default('gpt-4o'),
   ANTHROPIC_MODEL: z.string().default('claude-3-5-sonnet-latest'),
@@ -39,6 +39,9 @@ export function loadConfig(): Config {
     fileConfig.DEFAULT_PROVIDER = 'openrouter';
   } else if (oldModel && !fileConfig.GEMINI_MODEL) {
     fileConfig.GEMINI_MODEL = oldModel;
+  }
+  if (!['gemini', 'openrouter'].includes(fileConfig.DEFAULT_PROVIDER)) {
+    fileConfig.DEFAULT_PROVIDER = fileConfig.OPENROUTER_API_KEY ? 'openrouter' : 'gemini';
   }
 
   return configSchema.parse({

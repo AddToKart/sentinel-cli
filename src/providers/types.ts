@@ -15,12 +15,17 @@ export interface ProviderResponse {
   }>;
 }
 
+export interface ProviderRequestOptions {
+  maxRetries?: number;
+}
+
 export interface AIProvider {
   name: string;
-  sendMessage(messages: Message[], tools?: any[]): Promise<ProviderResponse>;
+  sendMessage(messages: Message[], tools?: any[], options?: ProviderRequestOptions): Promise<ProviderResponse>;
   streamMessage?(
     messages: Message[],
     tools: any[],
-    onChunk: (text: string) => void
+    onChunk: (text: string) => void,
+    options?: ProviderRequestOptions
   ): Promise<ProviderResponse>;
 }

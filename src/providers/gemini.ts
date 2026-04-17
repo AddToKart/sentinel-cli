@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI, Tool, Content } from '@google/generative-ai';
-import { AIProvider, Message, ProviderResponse } from './types.js';
+import { AIProvider, Message, ProviderRequestOptions, ProviderResponse } from './types.js';
+import { normalizeToolCall, withProviderRetries } from './utils.js';
 
 export class GeminiProvider implements AIProvider {
   name = 'gemini';
@@ -33,37 +34,44 @@ export class GeminiProvider implements AIProvider {
     return { model, history, lastMessage };
   }
 
-  async sendMessage(messages: Message[], tools: any[] = []): Promise<ProviderResponse> {
-    const { model, history, lastMessage } = this.buildModel(messages, tools);
-    const chat = model.startChat({ history });
-    const result = await chat.sendMessage(lastMessage.content);
-    const response = await result.response;
-    const calls = response.functionCalls();
-    if (calls && calls.length > 0) {
-      return {
-        content: response.text() || '',
-        toolCalls: calls.map((c: any) => ({ name: c.name, args: c.args, id: c.name })),
-      };
-    }
-    return { content: response.text() };
+  async sendMessage(messages: Message[], tools: any[] = [], options: ProviderRequestOptions = {}): Promise<ProviderResponse> {
+    return withProviderRetries(async () => {
+      const { model, history, lastMessage } = this.buildModel(messages, tools);
+      const chat = model.startChat({ history });
+      const result = await chat.sendMessage(lastMessage.content);
+      const response = await result.response;
+      const calls = response.functionCalls();
+      if (calls && calls.length > 0) {
+        return {
+          content: response.text() || '',
+          toolCalls: calls.map((call: any, index: number) => normalizeToolCall(call.name, call.args, call.id, 'gemini', index)),
+        };
+      }
+      return { content: response.text() };
+    }, options.maxRetries ?? 2);
   }
 
-  async streamMessage(messages: Message[], tools: any[], onChunk: (text: string) => void): Promise<ProviderResponse> {
-    const { model, history, lastMessage } = this.buildModel(messages, tools);
-    const chat = model.startChat({ history });
-    const streamResult = await chat.sendMessageStream(lastMessage.content);
+  async streamMessage(messages: Message[], tools: any[], onChunk: (text: string) => void, options: ProviderRequestOptions = {}): Promise<ProviderResponse> {
+    return withProviderRetries(async () => {
+      const { model, history, lastMessage } = this.buildModel(messages, tools);
+      const chat = model.startChat({ history });
+      const streamResult = await chat.sendMessageStream(lastMessage.content);
 
-    let fullText = '';
-    for await (const chunk of streamResult.stream) {
-      const text = chunk.text();
-      if (text) { onChunk(text); fullText += text; }
-    }
+      let fullText = '';
+      for await (const chunk of streamResult.stream) {
+        const text = chunk.text();
+        if (text) { onChunk(text); fullText += text; }
+      }
 
-    const finalResponse = await streamResult.response;
-    const calls = finalResponse.functionCalls();
-    if (calls && calls.length > 0) {
-      return { content: fullText, toolCalls: calls.map((c: any) => ({ name: c.name, args: c.args, id: c.name })) };
-    }
-    return { content: fullText };
+      const finalResponse = await streamResult.response;
+      const calls = finalResponse.functionCalls();
+      if (calls && calls.length > 0) {
+        return {
+          content: fullText,
+          toolCalls: calls.map((call: any, index: number) => normalizeToolCall(call.name, call.args, call.id, 'gemini-stream', index))
+        };
+      }
+      return { content: fullText };
+    }, options.maxRetries ?? 2);
   }
 }

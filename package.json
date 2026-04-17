@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --import ./test/register-ts-node.mjs test/run.ts"
   },
   "keywords": [],
   "author": "",

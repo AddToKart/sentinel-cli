@@ -12,6 +12,13 @@ interface MemoryItem {
   ts: number;
 }
 
+export interface WorkingSetSnapshot {
+  anchors: string[];
+  related: string[];
+  selected: string[];
+  focused: string[];
+}
+
 const HEAVY_TASK_RE = /\b(refactor|rewrite|redesign|migrate|overhaul|implement|build|architecture|code split|codesplit|multi[- ]step|end[- ]to[- ]end|optimi[sz]e|fix all|add feature)\b/i;
 const QUESTION_RE = /^\s*(what|why|how|can|is|are|do|does|did)\b/i;
 const LOW_CONFIDENCE_RE = /\b(not sure|unsure|maybe|probably|i think|might|can't|cannot|unknown)\b/i;
@@ -115,7 +122,9 @@ export class TaskContinuityTracker {
   private activeObjective = '';
   private mode: ContinuityMode = 'general';
   private focusedFiles: string[] = [];
-  private explicitTurnFiles: string[] = [];
+  private turnAnchorFiles: string[] = [];
+  private turnRelatedFiles: string[] = [];
+  private turnWorkingSetFiles: string[] = [];
   private followupTurn = false;
   private turnAllowsCreate = false;
   private readonly maxFocusedFiles = 8;
@@ -124,7 +133,9 @@ export class TaskContinuityTracker {
     this.activeObjective = '';
     this.mode = 'general';
     this.focusedFiles = [];
-    this.explicitTurnFiles = [];
+    this.turnAnchorFiles = [];
+    this.turnRelatedFiles = [];
+    this.turnWorkingSetFiles = [];
     this.followupTurn = false;
     this.turnAllowsCreate = false;
   }
@@ -133,7 +144,9 @@ export class TaskContinuityTracker {
     const text = input.trim();
     if (!text) return;
 
-    this.explicitTurnFiles = extractMentionedFiles(text).map(p => normalizeFilePath(p));
+    this.turnAnchorFiles = extractMentionedFiles(text).map(p => normalizeFilePath(p));
+    this.turnRelatedFiles = [];
+    this.turnWorkingSetFiles = [...this.turnAnchorFiles];
     this.followupTurn = this.isFollowup(text);
     this.turnAllowsCreate = CREATE_RE.test(text);
     const redesignIntent = REDESIGN_RE.test(text);
@@ -157,9 +170,15 @@ export class TaskContinuityTracker {
     }
   }
 
-  setExplicitTurnFiles(files: string[]) {
-    this.explicitTurnFiles = files.map(p => normalizeFilePath(p));
-    for (const filePath of files) {
+  setTurnContextFiles(anchorFiles: string[], relatedFiles: string[] = [], workingSetFiles: string[] = []) {
+    this.turnAnchorFiles = anchorFiles.map(p => normalizeFilePath(p));
+    this.turnRelatedFiles = relatedFiles.map(p => normalizeFilePath(p));
+    this.turnWorkingSetFiles = [...new Set([
+      ...this.turnAnchorFiles,
+      ...this.turnRelatedFiles,
+      ...workingSetFiles.map(p => normalizeFilePath(p))
+    ])];
+    for (const filePath of [...anchorFiles, ...relatedFiles, ...workingSetFiles]) {
       this.addFocusedFile(filePath);
     }
   }
@@ -180,7 +199,16 @@ export class TaskContinuityTracker {
   }
 
   getExplicitTurnFiles(): string[] {
-    return this.explicitTurnFiles.slice();
+    return [...this.turnWorkingSetFiles];
+  }
+
+  getWorkingSet(): WorkingSetSnapshot {
+    return {
+      anchors: [...this.turnAnchorFiles],
+      related: [...this.turnRelatedFiles],
+      selected: [...this.turnWorkingSetFiles],
+      focused: [...this.focusedFiles],
+    };
   }
 
   buildHints(): string[] {
@@ -190,6 +218,14 @@ export class TaskContinuityTracker {
     }
     if (this.mode === 'redesign') {
       hints.push('Current work mode is redesign: modify existing files first, avoid creating unrelated new files.');
+    }
+    if (this.turnAnchorFiles.length > 0) {
+      const anchorList = this.turnAnchorFiles.slice(-3).join(', ');
+      hints.push(`This turn is anchored on: ${anchorList}. Related files in the same area or directly linked from them are allowed when needed.`);
+    }
+    if (this.turnWorkingSetFiles.length > 0) {
+      const workingSetList = this.turnWorkingSetFiles.slice(-6).join(', ');
+      hints.push(`Current working set: ${workingSetList}. Treat it as the approved multi-file area for this turn.`);
     }
     if (this.focusedFiles.length > 0) {
       const focusList = this.focusedFiles.slice(-4).join(', ');
@@ -205,9 +241,11 @@ export class TaskContinuityTracker {
       'Task continuity lock:',
       `- Active objective: ${truncate(this.activeObjective || '(none)', 220)}`,
       `- Work mode: ${this.mode}`,
+      `- Turn anchors: ${this.turnAnchorFiles.length > 0 ? this.turnAnchorFiles.slice(-4).join(', ') : '(none)'}`,
+      `- Working set: ${this.turnWorkingSetFiles.length > 0 ? this.turnWorkingSetFiles.slice(-6).join(', ') : '(none)'}`,
       `- Focus files: ${focusList}`,
       '- Keep working on this objective until the user explicitly changes direction.',
-      '- In redesign mode, stay on focus files and avoid creating new files unless explicitly requested.',
+      '- In redesign mode, stay near the working set/focused files and avoid unrelated new files unless explicitly requested.',
     ].join('\n');
   }
 
@@ -218,19 +256,22 @@ export class TaskContinuityTracker {
     const normalizedPath = normalizeFilePath(filePath);
     const isFocused = this.focusedFiles.includes(normalizedPath);
     const fileExists = fs.existsSync(normalizedPath);
+    const isTurnAllowed = this.isAllowedByTurnAnchors(normalizedPath);
+    const isWorkingSetAllowed = this.isAllowedByWorkingSet(normalizedPath);
+    const isFocusAllowed = this.isAllowedByFocusedArea(normalizedPath);
 
-    if (this.explicitTurnFiles.length > 0 && !this.explicitTurnFiles.includes(normalizedPath)) {
-      const preferred = this.explicitTurnFiles[this.explicitTurnFiles.length - 1] ?? this.explicitTurnFiles[0];
-      return `Continuity policy: this turn explicitly targets mentioned files only. Use "${preferred}" unless the user asks to switch files.`;
+    if (this.turnAnchorFiles.length > 0 && !isTurnAllowed && !isWorkingSetAllowed && !isFocusAllowed) {
+      const preferred = this.turnAnchorFiles[this.turnAnchorFiles.length - 1] ?? this.turnAnchorFiles[0];
+      return `Continuity policy: stay near the files anchored this turn. Use "${preferred}" or a directly related/sibling file unless the user asks to switch areas.`;
     }
 
-    if (call.name === 'write_file' && this.mode === 'redesign' && !this.turnAllowsCreate && !fileExists) {
+    if (call.name === 'write_file' && this.mode === 'redesign' && !this.turnAllowsCreate && !fileExists && !isTurnAllowed && !isWorkingSetAllowed && !isFocusAllowed) {
       return `Continuity policy: redesign mode is active, but "${filePath}" does not exist. Edit an existing focused file unless user explicitly asks for a new file.`;
     }
 
-    if (this.followupTurn && this.mode === 'redesign' && this.focusedFiles.length > 0 && !isFocused) {
+    if (this.followupTurn && this.mode === 'redesign' && this.focusedFiles.length > 0 && !isFocused && !isFocusAllowed && !isWorkingSetAllowed && !isTurnAllowed) {
       const preferred = this.focusedFiles[this.focusedFiles.length - 1];
-      return `Continuity policy: this follow-up should stay on focused redesign targets. Use "${preferred}" (or another focused file) unless the user asks to switch files.`;
+      return `Continuity policy: this follow-up should stay in the current redesign area. Use "${preferred}" or another nearby related file unless the user asks to switch files.`;
     }
 
     return null;
@@ -250,6 +291,28 @@ export class TaskContinuityTracker {
     if (this.focusedFiles.length > this.maxFocusedFiles) {
       this.focusedFiles = this.focusedFiles.slice(this.focusedFiles.length - this.maxFocusedFiles);
     }
+  }
+
+  private isAllowedByTurnAnchors(normalizedPath: string): boolean {
+    if (this.turnAnchorFiles.includes(normalizedPath) || this.turnRelatedFiles.includes(normalizedPath)) return true;
+    return this.turnAnchorFiles.some(anchor => this.isSameArea(anchor, normalizedPath));
+  }
+
+  private isAllowedByWorkingSet(normalizedPath: string): boolean {
+    if (this.turnWorkingSetFiles.includes(normalizedPath)) return true;
+    return this.turnWorkingSetFiles.some(filePath => this.isSameArea(filePath, normalizedPath));
+  }
+
+  private isAllowedByFocusedArea(normalizedPath: string): boolean {
+    return this.focusedFiles.some(focused => this.isSameArea(focused, normalizedPath));
+  }
+
+  private isSameArea(sourcePath: string, candidatePath: string): boolean {
+    const sourceDir = path.dirname(sourcePath);
+    const candidateDir = path.dirname(candidatePath);
+    return candidatePath.startsWith(sourceDir + path.sep)
+      || sourcePath.startsWith(candidateDir + path.sep)
+      || sourceDir === candidateDir;
   }
 }
 
@@ -280,15 +343,22 @@ export function buildPolicyHints(userInput: string): string[] {
   const hints: string[] = [];
   if (/\b(refactor|edit|modify|change|update|fix|redesign)\b/i.test(userInput)) {
     hints.push('Before modifying existing files, prefer read_file to gather exact current content.');
+    hints.push('Prefer edit_file for targeted edits to existing files. Use write_file for new files or full rewrites only.');
   }
   if (/\b(search|find|where|locate|grep)\b/i.test(userInput)) {
     hints.push('Use grep/glob first for discovery, then read_file for concrete edits.');
+  }
+  if (/\b(project|codebase|repository|repo|architecture)\b/i.test(userInput)) {
+    hints.push('Use list_directory, grep, or glob to narrow scope before loading large codebase context.');
   }
   if (/https?:\/\//i.test(userInput) || /\bdocs|documentation|api\b/i.test(userInput)) {
     hints.push('Use web_fetch for external docs before implementing API-specific behavior.');
   }
   if (/\bbuild|test|compile|tsc|npm\b/i.test(userInput)) {
     hints.push('After code changes, run build/tests to verify behavior.');
+  }
+  if (/\b(shell|command|terminal|powershell|bash|npm run|pnpm|yarn)\b/i.test(userInput)) {
+    hints.push('When using execute_shell, set cwd and timeout when the command scope is clear.');
   }
   return hints;
 }
@@ -335,6 +405,12 @@ export function validateToolCall(call: { name: string; args: any }, toolDefs: an
     const val = call.args?.[key];
     if (val === undefined || val === null || val === '') {
       return `Tool "${call.name}" missing required argument "${key}".`;
+    }
+  }
+  if (call.name === 'execute_shell') {
+    const timeout = call.args?.timeout_ms;
+    if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0 || timeout > 120000)) {
+      return 'Tool "execute_shell" timeout_ms must be between 1 and 120000.';
     }
   }
   return null;

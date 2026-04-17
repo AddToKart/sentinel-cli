@@ -12,7 +12,7 @@ let historyTempBuf = '';
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', '.cache', 'coverage']);
-const SLASH_COMMANDS = [
+export const SLASH_COMMANDS = [
   '/help',
   '/models',
   '/tools',
@@ -48,7 +48,21 @@ function truncateRight(text: string, max: number): string {
   return `${text.slice(0, max - 1)}…`;
 }
 
-function getProjectFiles(): string[] {
+export function getCommandSuggestions(buffer: string, commands: string[] = SLASH_COMMANDS): string[] {
+  const trimmed = buffer.trimStart().toLowerCase();
+  if (!/^\/[^\s]*$/.test(trimmed)) return [];
+
+  const directMatches = trimmed === '/'
+    ? commands.slice()
+    : commands.filter((cmd) => cmd.startsWith(trimmed));
+  const fallbackMatches = directMatches.length === 0 && trimmed.length > 1
+    ? commands.filter((cmd) => cmd.includes(trimmed.slice(1)))
+    : [];
+
+  return (directMatches.length > 0 ? directMatches : fallbackMatches).slice(0, 6);
+}
+
+export function getProjectFiles(rootDir: string = process.cwd()): string[] {
   const results: string[] = [];
 
   function walk(dir: string, prefix = '') {
@@ -72,8 +86,82 @@ function getProjectFiles(): string[] {
     }
   }
 
-  walk(process.cwd());
+  walk(rootDir);
   return results;
+}
+
+export interface SmartInputFrameParams {
+  width: number;
+  buffer: string;
+  statusLines: string[] | undefined;
+  placeholder?: string;
+  mentionStart: number;
+  mentionFiltered: string[];
+  mentionSelectedIdx: number;
+  commandFiltered: string[];
+  commandSelectedIdx: number;
+}
+
+export function buildSmartInputFrame(params: SmartInputFrameParams) {
+  const {
+    width,
+    buffer,
+    statusLines,
+    placeholder = THEME.dim('Type your message, @path/to/file, or /command...'),
+    mentionStart,
+    mentionFiltered,
+    mentionSelectedIdx,
+    commandFiltered,
+    commandSelectedIdx,
+  } = params;
+
+  const safeWidth = Math.max(54, width || 80);
+  const promptPrefix = `${THEME.border('│')} ${THEME.accent(figures.pointerSmall)} `;
+  const promptWidth = Math.max(12, safeWidth - visibleLength(promptPrefix) - 3);
+  const preview = buffer ? truncateLeft(buffer, promptWidth) : '';
+  const display = buffer ? THEME.userText(highlightMentions(preview)) : placeholder;
+  const cursorColumn = visibleLength(promptPrefix) + visibleLength(preview);
+  const showCommandSuggestions = commandFiltered.length > 0;
+  const showMentionSuggestions = !showCommandSuggestions && mentionStart >= 0 && mentionFiltered.length > 0;
+  const lines: string[] = [];
+
+  if (statusLines && statusLines.length > 0) {
+    lines.push(...statusLines);
+  }
+
+  lines.push(THEME.border(`╭${'─'.repeat(Math.max(0, safeWidth - 2))}╮`));
+  lines.push(`${promptPrefix}${display}`);
+  lines.push(THEME.border(`╰${'─'.repeat(Math.max(0, safeWidth - 2))}╯`));
+  lines.push(THEME.dim(`  ${figures.arrowUp}/${figures.arrowDown} history  Tab autocomplete  Enter submit  Esc dismiss`));
+
+  if (showCommandSuggestions) {
+    const suggestionWidth = Math.max(16, safeWidth - 12);
+    for (let i = 0; i < commandFiltered.length; i++) {
+      const command = commandFiltered[i] ?? '';
+      const selected = i === commandSelectedIdx;
+      const label = truncateRight(command, suggestionWidth);
+      const line = selected
+        ? chalk.bgHex(COLORS.slate800)(`${THEME.accent(` ${figures.play} `)}${chalk.hex(COLORS.slate100)(label)}`)
+        : THEME.dim(`   ${label}`);
+      lines.push(`${THEME.dim(' ⌘ ')}${line}`);
+    }
+  } else if (showMentionSuggestions) {
+    const suggestionWidth = Math.max(16, safeWidth - 14);
+    for (let i = 0; i < mentionFiltered.length; i++) {
+      const file = mentionFiltered[i] ?? '';
+      const selected = i === mentionSelectedIdx;
+      const icon = file.endsWith('/') ? chalk.yellow('dir') : THEME.dim('file');
+      const label = truncateRight(file, suggestionWidth);
+      const line = selected
+        ? chalk.bgHex(COLORS.slate800)(`${THEME.accent(` ${figures.play} `)}${chalk.hex(COLORS.slate100)(label)}`)
+        : THEME.dim(`   ${label}`);
+      lines.push(` ${icon} ${line}`);
+    }
+  }
+
+  const inputRowIndex = (statusLines?.length ?? 0) + 1;
+  const rowsBelowInput = lines.length - 1 - inputRowIndex;
+  return { lines, cursorColumn, inputRowIndex, rowsBelowInput };
 }
 
 export async function smartInput(statusLines?: string[]): Promise<string> {
@@ -111,21 +199,7 @@ export async function smartInput(statusLines?: string[]): Promise<string> {
     }
 
     function updateCommandSuggestions() {
-      const trimmed = buf.trimStart().toLowerCase();
-      if (!/^\/[^\s]*$/.test(trimmed)) {
-        commandFiltered = [];
-        commandSelectedIdx = 0;
-        return;
-      }
-
-      const directMatches = trimmed === '/'
-        ? SLASH_COMMANDS.slice()
-        : SLASH_COMMANDS.filter((cmd) => cmd.startsWith(trimmed));
-      const fallbackMatches = directMatches.length === 0 && trimmed.length > 1
-        ? SLASH_COMMANDS.filter((cmd) => cmd.includes(trimmed.slice(1)))
-        : [];
-
-      commandFiltered = (directMatches.length > 0 ? directMatches : fallbackMatches).slice(0, 6);
+      commandFiltered = getCommandSuggestions(buf, SLASH_COMMANDS);
       commandSelectedIdx = Math.min(commandSelectedIdx, Math.max(0, commandFiltered.length - 1));
     }
 
@@ -158,53 +232,17 @@ export async function smartInput(statusLines?: string[]): Promise<string> {
 
     function render() {
       updateCommandSuggestions();
-
-      const width = Math.max(54, process.stdout.columns || 80);
-      const promptPrefix = `${THEME.border('│')} ${THEME.accent(figures.pointerSmall)} `;
-      const promptWidth = Math.max(12, width - visibleLength(promptPrefix) - 3);
-      const preview = buf ? truncateLeft(buf, promptWidth) : '';
-      const display = buf ? THEME.userText(highlightMentions(preview)) : placeholder;
-      const cursorColumn = visibleLength(promptPrefix) + visibleLength(preview);
-      const showCommandSuggestions = commandFiltered.length > 0;
-      const showMentionSuggestions = !showCommandSuggestions && mentionStart >= 0 && mentionFiltered.length > 0;
-      const lines: string[] = [];
-
-      if (statusLines && statusLines.length > 0) {
-        lines.push(...statusLines);
-      }
-
-      lines.push(THEME.border(`╭${'─'.repeat(Math.max(0, width - 2))}╮`));
-      lines.push(`${promptPrefix}${display}`);
-      lines.push(THEME.border(`╰${'─'.repeat(Math.max(0, width - 2))}╯`));
-      lines.push(THEME.dim(`  ${figures.arrowUp}/${figures.arrowDown} history  Tab autocomplete  Enter submit  Esc dismiss`));
-
-      if (showCommandSuggestions) {
-        const suggestionWidth = Math.max(16, width - 12);
-        for (let i = 0; i < commandFiltered.length; i++) {
-          const cmd = commandFiltered[i] ?? '';
-          const selected = i === commandSelectedIdx;
-          const label = truncateRight(cmd, suggestionWidth);
-          const line = selected
-            ? chalk.bgHex(COLORS.slate800)(`${THEME.accent(` ${figures.play} `)}${chalk.hex(COLORS.slate100)(label)}`)
-            : THEME.dim(`   ${label}`);
-          lines.push(`${THEME.dim(' ⌘ ')}${line}`);
-        }
-      } else if (showMentionSuggestions) {
-        const suggestionWidth = Math.max(16, width - 14);
-        for (let i = 0; i < mentionFiltered.length; i++) {
-          const file = mentionFiltered[i] ?? '';
-          const selected = i === mentionSelectedIdx;
-          const icon = file.endsWith('/') ? chalk.yellow('dir') : THEME.dim('file');
-          const label = truncateRight(file, suggestionWidth);
-          const line = selected
-            ? chalk.bgHex(COLORS.slate800)(`${THEME.accent(` ${figures.play} `)}${chalk.hex(COLORS.slate100)(label)}`)
-            : THEME.dim(`   ${label}`);
-          lines.push(` ${icon} ${line}`);
-        }
-      }
-
-      const inputRowIndex = (statusLines?.length ?? 0) + 1;
-      const rowsBelowInput = lines.length - 1 - inputRowIndex;
+      const { lines, cursorColumn, inputRowIndex, rowsBelowInput } = buildSmartInputFrame({
+        width: process.stdout.columns || 80,
+        buffer: buf,
+        statusLines,
+        placeholder,
+        mentionStart,
+        mentionFiltered,
+        mentionSelectedIdx,
+        commandFiltered,
+        commandSelectedIdx,
+      });
 
       process.stdout.write('\x1b[?25l');
       clearRender();

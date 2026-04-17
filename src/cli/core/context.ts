@@ -21,6 +21,46 @@ function normalizeLoadKey(filePath: string): string {
   return path.normalize(filePath).toLowerCase();
 }
 
+function stripRefDecorators(ref: string): string {
+  return ref.split('#')[0]?.split('?')[0]?.trim() ?? '';
+}
+
+function isLikelyLocalRef(ref: string): boolean {
+  if (!ref) return false;
+  if (/^(?:[a-z]+:)?\/\//i.test(ref)) return false;
+  if (ref.startsWith('#') || ref.startsWith('data:') || ref.startsWith('mailto:') || ref.startsWith('tel:')) return false;
+  return true;
+}
+
+function resolveLocalReference(baseFilePath: string, ref: string): string | null {
+  const cleaned = stripRefDecorators(ref);
+  if (!cleaned || !isLikelyLocalRef(cleaned)) return null;
+  const fullPath = path.resolve(path.dirname(baseFilePath), cleaned);
+  if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) return null;
+  return fullPath;
+}
+
+function extractDirectFileReferences(baseFilePath: string, content: string): string[] {
+  const refs = new Set<string>();
+  const patterns = [
+    /\b(?:src|href)=["']([^"']+)["']/gi,
+    /@import\s+(?:url\()?["']?([^"')\s]+)["']?\)?/gi,
+    /\burl\(\s*["']?([^"')\s]+)["']?\s*\)/gi,
+    /\bimport\s+(?:[^'"]+?\s+from\s+)?["']([^"']+)["']/gi,
+    /\brequire\(\s*["']([^"']+)["']\s*\)/gi,
+  ];
+
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(content)) !== null) {
+      const candidate = resolveLocalReference(baseFilePath, String(match[1] ?? ''));
+      if (candidate) refs.add(candidate);
+    }
+  }
+
+  return [...refs];
+}
+
 export function readProjectContext(): string {
   const sentinelMdPath = path.join(process.cwd(), 'SENTINEL.md');
   if (!fs.existsSync(sentinelMdPath)) return '';
@@ -40,6 +80,9 @@ export function composeSystemPrompt(projectContext: string, contextHeader: strin
 export interface MentionContextResult {
   content: string;
   loadedFiles: string[];
+  anchorFiles: string[];
+  relatedFiles: string[];
+  workingSetFiles: string[];
 }
 
 export async function injectMentionedContextWithMetadata(input: string): Promise<MentionContextResult> {
@@ -48,6 +91,26 @@ export async function injectMentionedContextWithMetadata(input: string): Promise
   const injections: string[] = [];
   const injected = new Set<string>();
   const loadedFiles: string[] = [];
+  const anchorFiles: string[] = [];
+  const relatedFiles: string[] = [];
+
+  async function loadRelatedFiles(parentPath: string, content: string) {
+    const refs = extractDirectFileReferences(parentPath, content).slice(0, 6);
+    for (const refPath of refs) {
+      const loadKey = normalizeLoadKey(refPath);
+      if (injected.has(loadKey)) continue;
+      injected.add(loadKey);
+      relatedFiles.push(refPath);
+      try {
+        const relatedContent = fs.readFileSync(refPath, 'utf-8');
+        const relativePath = path.relative(process.cwd(), refPath).replace(/\\/g, '/');
+        const ext = path.extname(refPath).slice(1) || 'text';
+        process.stdout.write(chalk.dim(` 🔗 Linked context: `) + THEME.accent(relativePath) + chalk.dim(` (${relatedContent.split('\n').length} lines)\n`));
+        injections.push(`--- Related File: ${relativePath} ---\n\`\`\`${ext}\n${relatedContent}\n\`\`\`\n---`);
+        loadedFiles.push(refPath);
+      } catch { /* skip unreadable */ }
+    }
+  }
 
   let atMatch;
   while ((atMatch = AT_MENTION_PATTERN.exec(input)) !== null) {
@@ -70,6 +133,8 @@ export async function injectMentionedContextWithMetadata(input: string): Promise
         process.stdout.write(chalk.dim(` 📄 Auto-loaded: `) + THEME.accent(mentionedPath) + chalk.dim(` (${content.split('\n').length} lines)\n`));
         injections.push(`--- File: ${mentionedPath} ---\n\`\`\`${ext}\n${content}\n\`\`\`\n---`);
         loadedFiles.push(fullPath);
+        anchorFiles.push(fullPath);
+        await loadRelatedFiles(fullPath, content);
       } catch { /* skip unreadable */ }
     }
   }
@@ -89,12 +154,15 @@ export async function injectMentionedContextWithMetadata(input: string): Promise
         process.stdout.write(chalk.dim(` 📄 Auto-loaded: `) + THEME.accent(mentionedPath) + chalk.dim(` (${content.split('\n').length} lines)\n`));
         injections.push(`--- File: ${mentionedPath} ---\n\`\`\`${ext}\n${content}\n\`\`\`\n---`);
         loadedFiles.push(fullPath);
+        anchorFiles.push(fullPath);
+        await loadRelatedFiles(fullPath, content);
       } catch { /* skip unreadable */ }
     }
   }
 
-  if (injections.length === 0) return { content: input, loadedFiles };
-  return { content: input + '\n\n' + injections.join('\n\n'), loadedFiles };
+  const workingSetFiles = [...new Set([...anchorFiles, ...relatedFiles])];
+  if (injections.length === 0) return { content: input, loadedFiles, anchorFiles, relatedFiles, workingSetFiles };
+  return { content: input + '\n\n' + injections.join('\n\n'), loadedFiles, anchorFiles, relatedFiles, workingSetFiles };
 }
 
 export async function injectMentionedContext(input: string): Promise<string> {

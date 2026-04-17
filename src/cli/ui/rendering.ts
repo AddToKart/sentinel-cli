@@ -6,6 +6,71 @@ import { COLORS, THEME, sentinelLogo } from './theme.js';
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const AT_MENTION_RE = /@([\w./\\-]+)/g;
 const FILE_EXT_RE = /\b([\w./\\-]+\.(?:ts|tsx|js|jsx|py|html|css|json|md|txt|sh|yaml|yml|go|rs|java|c|cpp|h|toml|sql|env))\b/gi;
+const JS_KEYWORDS = /\b(const|let|var|function|return|if|else|for|while|switch|case|break|continue|new|class|extends|import|from|export|default|async|await|try|catch|finally|throw|interface|type|implements|public|private|protected|static)\b/g;
+
+function formatMarkdownInline(text: string): string {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, (_, t) => chalk.bold(chalk.hex(COLORS.slate100)(t)))
+    .replace(/\*(.+?)\*/g, (_, t) => chalk.italic(chalk.hex(COLORS.slate300)(t)))
+    .replace(/`([^`\n]+)`/g, (_, t) => THEME.codeBg(` ${t} `))
+    .replace(/^# (.+)$/gm, (_, t) => chalk.bold.hex(COLORS.green300)('⬦ ' + t.toUpperCase()))
+    .replace(/^## (.+)$/gm, (_, t) => chalk.bold.hex(COLORS.green300)('⬦ ' + t))
+    .replace(/^### (.+)$/gm, (_, t) => chalk.bold.hex(COLORS.green300)('  \u2022 ' + t))
+    .replace(/^(\s*)[-*] (.+)$/gm, (_, indent, item) => `${indent}${chalk.hex(COLORS.green500)('⬦')} ${item}`)
+    .replace(/^(\s*)(\d+)\. (.+)$/gm, (_, indent, n, item) => `${indent}${chalk.hex(COLORS.green500)(n + '.')} ${item}`);
+}
+
+function highlightHtmlLine(line: string): string {
+  let out = line;
+  out = out.replace(/<!--.*?-->/g, (m) => chalk.hex(COLORS.slate500)(m));
+  out = out.replace(/<!DOCTYPE[^>]*>/gi, (m) => chalk.hex(COLORS.green500)(m));
+  out = out.replace(/(<\/?)([a-zA-Z][\w:-]*)/g, (_, open, tag) => `${chalk.hex(COLORS.green500)(open)}${chalk.hex(COLORS.green300)(tag)}`);
+  out = out.replace(/\b([a-zA-Z_:][\w:.-]*)(=)/g, (_, attr, eq) => `${chalk.hex(COLORS.slate100)(attr)}${chalk.hex(COLORS.green500)(eq)}`);
+  out = out.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, (m) => chalk.hex(COLORS.slate200)(m));
+  out = out.replace(/\/?>/g, (m) => chalk.hex(COLORS.green500)(m));
+  return out;
+}
+
+function highlightCssLine(line: string): string {
+  let out = line;
+  out = out.replace(/\/\*.*?\*\//g, (m) => chalk.hex(COLORS.slate500)(m));
+  out = out.replace(/(^|\s)([#.]?[a-zA-Z][\w-]*)(?=\s*\{)/g, (_, ws, selector) => `${ws}${chalk.hex(COLORS.green300)(selector)}`);
+  out = out.replace(/\b([a-z-]+)(\s*:)/gi, (_, prop, colon) => `${chalk.hex(COLORS.slate100)(prop)}${chalk.hex(COLORS.green500)(colon)}`);
+  out = out.replace(/#[0-9a-fA-F]{3,8}\b/g, (m) => chalk.hex(COLORS.green400)(m));
+  out = out.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, (m) => chalk.hex(COLORS.slate200)(m));
+  out = out.replace(/[{};(),]/g, (m) => chalk.hex(COLORS.green500)(m));
+  return out;
+}
+
+function highlightJsLine(line: string): string {
+  let out = line;
+  out = out.replace(/\/\/.*$/g, (m) => chalk.hex(COLORS.slate500)(m));
+  out = out.replace(/\/\*.*?\*\//g, (m) => chalk.hex(COLORS.slate500)(m));
+  out = out.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, (m) => chalk.hex(COLORS.slate200)(m));
+  out = out.replace(JS_KEYWORDS, (m) => chalk.hex(COLORS.green400)(m));
+  out = out.replace(/\b(true|false|null|undefined)\b/g, (m) => chalk.hex(COLORS.green300)(m));
+  out = out.replace(/\b\d+(?:\.\d+)?\b/g, (m) => chalk.hex(COLORS.green300)(m));
+  return out;
+}
+
+function highlightShellLine(line: string): string {
+  let out = line;
+  out = out.replace(/#.*$/g, (m) => chalk.hex(COLORS.slate500)(m));
+  out = out.replace(/(^\s*)([\w./-]+)/, (_, ws, cmd) => `${ws}${chalk.hex(COLORS.green400)(cmd)}`);
+  out = out.replace(/\s(--?[\w-]+)/g, (_, flag) => ` ${chalk.hex(COLORS.green300)(flag)}`);
+  out = out.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, (m) => chalk.hex(COLORS.slate200)(m));
+  return out;
+}
+
+function highlightCodeLine(line: string, languageHint: string): string {
+  const lang = languageHint.toLowerCase();
+  if (!line.trim()) return line;
+  if (['html', 'htm', 'xml', 'svg'].includes(lang)) return highlightHtmlLine(line);
+  if (['css', 'scss', 'sass'].includes(lang)) return highlightCssLine(line);
+  if (['js', 'jsx', 'ts', 'tsx', 'json'].includes(lang)) return highlightJsLine(line);
+  if (['sh', 'bash', 'zsh', 'shell', 'powershell', 'ps1'].includes(lang)) return highlightShellLine(line);
+  return chalk.hex(COLORS.slate200)(line);
+}
 
 function truncateMiddle(text: string, max: number): string {
   if (max <= 0) return '';
@@ -69,19 +134,8 @@ export async function streamText(text: string): Promise<void> {
 }
 
 export function renderMarkdown(text: string): string {
-  // 1. First, format markdown elements (bold, italic, inline code)
-  let formatted = text
-    .replace(/\*\*(.+?)\*\*/g, (_, t) => chalk.bold(chalk.hex(COLORS.slate100)(t)))
-    .replace(/\*(.+?)\*/g, (_, t) => chalk.italic(chalk.hex(COLORS.slate300)(t)))
-    .replace(/`([^`\n]+)`/g, (_, t) => THEME.codeBg(` ${t} `))
-    .replace(/^# (.+)$/gm, (_, t) => chalk.bold.hex(COLORS.green300)('⬦ ' + t.toUpperCase()))
-    .replace(/^## (.+)$/gm, (_, t) => chalk.bold.hex(COLORS.green300)('⬦ ' + t))
-    .replace(/^### (.+)$/gm, (_, t) => chalk.bold.hex(COLORS.green300)('  \u2022 ' + t))
-    .replace(/^(\s*)[-*] (.+)$/gm, (_, indent, item) => `${indent}${chalk.hex(COLORS.green500)('⬦')} ${item}`)
-    .replace(/^(\s*)(\d+)\. (.+)$/gm, (_, indent, n, item) => `${indent}${chalk.hex(COLORS.green500)(n + '.')} ${item}`);
-
-  // 2. Parse blocks to handle code vs normal text
-  const blocks = formatted.split(/(```[\s\S]*?```)/g);
+  // Parse blocks first so markdown formatting does not alter fenced code.
+  const blocks = text.split(/(```[\s\S]*?```)/g);
   let result = '';
 
   for (let i = 0; i < blocks.length; i++) {
@@ -90,8 +144,9 @@ export function renderMarkdown(text: string): string {
       // Code block
       const lines = block.split('\n');
       const firstLine = lines[0] || '';
-      const langMatch = firstLine.match(/```(\w+)?/);
-      const lang = langMatch && langMatch[1] ? ` ${langMatch[1]} ` : ' code ';
+      const langMatch = firstLine.match(/```([\w#+-]+)?/);
+      const languageHint = langMatch && langMatch[1] ? langMatch[1] : '';
+      const lang = languageHint ? ` ${languageHint} ` : ' code ';
       
       const width = Math.max(34, Math.min(72, (process.stdout.columns || 80) - 8));
       const topBar = `╭─${lang}${'─'.repeat(Math.max(0, width - lang.length - 2))}╮`;
@@ -100,24 +155,26 @@ export function renderMarkdown(text: string): string {
       const codeLines = lines.slice(1, -1);
       
       result += `${THEME.icon('┃')} ${THEME.border(topBar)}\n`;
-      for (const line of codeLines) {
+      for (const rawLine of codeLines) {
+        const highlightedLine = highlightCodeLine(rawLine, languageHint);
         // Pad line to width
-        const rawLine = line.replace(ANSI_RE, '');
-        const padLen = Math.max(0, width - 2 - rawLine.length);
-        const paddedLine = line + ' '.repeat(padLen);
+        const visibleLine = highlightedLine.replace(ANSI_RE, '');
+        const padLen = Math.max(0, width - 2 - visibleLine.length);
+        const paddedLine = highlightedLine + ' '.repeat(padLen);
         
-        result += `${THEME.icon('┃')} ${THEME.border('│')} ${chalk.hex(COLORS.slate200)(paddedLine)} ${THEME.border('│')}\n`;
+        result += `${THEME.icon('┃')} ${THEME.border('│')} ${paddedLine} ${THEME.border('│')}\n`;
       }
       result += `${THEME.icon('┃')} ${THEME.border(bottomBar)}\n`;
       
     } else {
       // Normal text
-      if (!block.trim()) {
+      const formatted = formatMarkdownInline(block);
+      if (!formatted.trim()) {
         if (i > 0 && i < blocks.length - 1) result += `${THEME.icon('┃')}\n`;
         continue;
       }
       
-      const lines = block.split('\n');
+      const lines = formatted.split('\n');
       for (let j = 0; j < lines.length; j++) {
         // Skip trailing empty lines
         if (j === lines.length - 1 && !lines[j]) continue;

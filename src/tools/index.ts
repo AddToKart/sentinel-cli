@@ -1,4 +1,5 @@
-import { execSync } from 'child_process';
+import { spawn } from 'child_process';
+import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
@@ -9,12 +10,35 @@ export interface ToolDefinition {
   name: string;
   description: string;
   parameters: any;
-  execute: (args: any) => Promise<string>;
+  execute: (args: any, context?: ToolExecutionContext) => Promise<string>;
   displayName?: string;
   getLabel?: (args: any) => string;
   requiresConfirmation?: boolean;
   getRiskSummary?: (args: any) => string;
 }
+
+export interface ToolOutputChunk {
+  stream: 'stdout' | 'stderr' | 'system';
+  text: string;
+}
+
+export interface ToolExecutionContext {
+  signal?: AbortSignal;
+  onOutput?: (chunk: ToolOutputChunk) => void;
+}
+
+export interface ShellSpawnResult extends EventEmitter {
+  stdout: NodeJS.ReadableStream | null;
+  stderr: NodeJS.ReadableStream | null;
+  kill(signal?: NodeJS.Signals | number): boolean;
+}
+
+export type ShellSpawnFactory = (command: string, options: {
+  cwd: string;
+  shell: boolean;
+  windowsHide: boolean;
+  env: NodeJS.ProcessEnv;
+}) => ShellSpawnResult;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function resolvePath(filePath: string): string {
@@ -31,6 +55,49 @@ function detectEol(content: string): '\r\n' | '\n' {
 
 function withEol(content: string, eol: '\r\n' | '\n'): string {
   return normalizeNewlines(content).replace(/\n/g, eol);
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n...[truncated at ${maxChars} chars]`;
+}
+
+function appendWithLimit(current: string, chunk: string, maxChars: number): string {
+  const combined = current + chunk;
+  if (combined.length <= maxChars) return combined;
+  return combined.slice(combined.length - maxChars);
+}
+
+function addLineNumbers(content: string): string {
+  const lines = content.split('\n');
+  const width = String(lines.length).length;
+  return lines
+    .map((line, idx) => `${String(idx + 1).padStart(width, ' ')} | ${line}`)
+    .join('\n');
+}
+
+function formatCodeBlock(lang: string, content: string): string {
+  return `\`\`\`${lang}\n${content}\n\`\`\``;
+}
+
+function formatToolResult(title: string, sections: Array<{ label: string; content: string }>): string {
+  const parts = [title];
+  for (const section of sections) {
+    parts.push('');
+    parts.push(`${section.label}:`);
+    parts.push(section.content);
+  }
+  return parts.join('\n');
+}
+
+function escapeRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 // Detects AI omission placeholders that would truncate files
@@ -101,21 +168,121 @@ export const shellTool: ToolDefinition = {
     type: 'object',
     properties: {
       command: { type: 'string', description: 'The shell command to run' },
+      cwd: { type: 'string', description: 'Working directory to run the command from (default: current directory)' },
+      timeout_ms: { type: 'number', description: 'Timeout in milliseconds (default: 30000, max: 120000)' },
     },
     required: ['command'],
   },
   requiresConfirmation: true,
-  getLabel: ({ command }) => `$ ${command}`,
-  getRiskSummary: ({ command }) => `Run: ${command}`,
-  async execute({ command }) {
-    try {
-      const output = execSync(command, { encoding: 'utf-8', maxBuffer: 1024 * 1024 * 10 });
-      return output || '(no output)';
-    } catch (err: any) {
-      return `Exit code ${err.status ?? '?'}\nStdout: ${err.stdout || ''}\nStderr: ${err.stderr || ''}`;
-    }
+  getLabel: ({ command, cwd }) => `${cwd ? `${cwd} ` : ''}$ ${command}`,
+  getRiskSummary: ({ command, cwd, timeout_ms }) => {
+    const parts = [`Run: ${command}`];
+    if (cwd) parts.push(`cwd=${cwd}`);
+    if (timeout_ms) parts.push(`timeout=${timeout_ms}ms`);
+    return parts.join(' | ');
+  },
+  async execute({ command, cwd, timeout_ms }, context = {}) {
+    const workingDir = cwd ? resolvePath(cwd) : process.cwd();
+    if (!fs.existsSync(workingDir)) return `Error: working directory not found: ${cwd}`;
+    if (!fs.statSync(workingDir).isDirectory()) return `Error: working directory is not a directory: ${cwd}`;
+
+    const timeout = Math.max(1000, Math.min(Number(timeout_ms) || 30000, 120000));
+    return runStreamingShellCommand(command, workingDir, timeout, context);
   },
 };
+
+export function runStreamingShellCommand(
+  command: string,
+  workingDir: string,
+  timeout: number,
+  context: ToolExecutionContext = {},
+  spawnFactory: ShellSpawnFactory = (cmd, options) => spawn(cmd, options)
+): Promise<string> {
+  const maxCapture = 1024 * 256;
+
+  return new Promise<string>((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let aborted = false;
+    let settled = false;
+
+    const child = spawnFactory(command, {
+      cwd: workingDir,
+      shell: true,
+      windowsHide: true,
+      env: process.env,
+    });
+
+    const finish = (result: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (context.signal && abortHandler) {
+        context.signal.removeEventListener('abort', abortHandler);
+      }
+      resolve(result);
+    };
+
+    const emitChunk = (stream: 'stdout' | 'stderr', raw: Buffer | string) => {
+      const text = String(raw);
+      if (stream === 'stdout') {
+        stdout = appendWithLimit(stdout, text, maxCapture);
+      } else {
+        stderr = appendWithLimit(stderr, text, maxCapture);
+      }
+      context.onOutput?.({ stream, text });
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      context.onOutput?.({ stream: 'system', text: `Process timed out after ${timeout}ms.\n` });
+      child.kill('SIGTERM');
+    }, timeout);
+
+    const abortHandler = () => {
+      aborted = true;
+      context.onOutput?.({ stream: 'system', text: 'Process cancelled by harness.\n' });
+      child.kill('SIGTERM');
+    };
+
+    if (context.signal) {
+      if (context.signal.aborted) {
+        abortHandler();
+      } else {
+        context.signal.addEventListener('abort', abortHandler, { once: true });
+      }
+    }
+
+    child.stdout?.on('data', (chunk) => emitChunk('stdout', chunk));
+    child.stderr?.on('data', (chunk) => emitChunk('stderr', chunk));
+
+    child.on('error', (err) => {
+      finish(formatToolResult('Shell command failed to start.', [
+        { label: 'Command', content: command },
+        { label: 'Working directory', content: workingDir },
+        { label: 'Error', content: err.message },
+      ]));
+    });
+
+    child.on('close', (code, signal) => {
+      const statusLabel = timedOut
+        ? `Shell command timed out after ${timeout}ms.`
+        : aborted
+          ? 'Shell command cancelled by harness.'
+          : code === 0
+            ? 'Shell command completed successfully.'
+            : `Shell command failed with exit code ${code ?? '?'}${signal ? ` (signal: ${signal})` : ''}.`;
+
+      finish(formatToolResult(statusLabel, [
+        { label: 'Command', content: command },
+        { label: 'Working directory', content: workingDir },
+        { label: 'Stdout', content: formatCodeBlock('text', truncateText(stdout || '(no stdout)', 12000)) },
+        { label: 'Stderr', content: formatCodeBlock('text', truncateText(stderr || '(no stderr)', 12000)) },
+      ]));
+    });
+  });
+}
 
 // ─── Read File ────────────────────────────────────────────────────────────────
 export const readFileTool: ToolDefinition = {
@@ -137,7 +304,11 @@ export const readFileTool: ToolDefinition = {
       const stat = fs.statSync(fullPath);
       if (stat.size > 1024 * 1024) return `File too large (${(stat.size / 1024).toFixed(0)} KB). Use read_codebase for directories.`;
       const content = fs.readFileSync(fullPath, 'utf-8');
-      return `\`\`\`${path.extname(filePath).slice(1) || 'text'}\n${content}\n\`\`\``;
+      const numbered = addLineNumbers(content);
+      return formatToolResult(`Read ${filePath}`, [
+        { label: 'Metadata', content: `${content.split('\n').length} lines | ${formatBytes(stat.size)}` },
+        { label: 'Contents', content: formatCodeBlock(path.extname(filePath).slice(1) || 'text', numbered) },
+      ]);
     } catch (err: any) {
       return `Error reading file: ${err.message}`;
     }
@@ -262,7 +433,14 @@ export const grepTool: ToolDefinition = {
   }) {
     const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__']);
     const fullRoot = resolvePath(searchPath);
-    const regex = new RegExp(pattern, case_insensitive ? 'gi' : 'g');
+    let regex: RegExp;
+    let mode = 'regex';
+    try {
+      regex = new RegExp(pattern, case_insensitive ? 'gi' : 'g');
+    } catch {
+      regex = new RegExp(escapeRegex(pattern), case_insensitive ? 'gi' : 'g');
+      mode = 'literal';
+    }
     const results: string[] = [];
     let fileCount = 0;
 
@@ -313,7 +491,10 @@ export const grepTool: ToolDefinition = {
     }
 
     if (results.length === 0) return `No matches found for "${pattern}"`;
-    return `Found matches in ${fileCount} file(s):\n${results.join('\n')}`;
+    return formatToolResult(`Found matches in ${fileCount} file(s).`, [
+      { label: 'Pattern', content: `${pattern} (${mode}${case_insensitive ? ', case-insensitive' : ''})` },
+      { label: 'Results', content: results.join('\n') },
+    ]);
   },
 };
 
@@ -424,7 +605,10 @@ export const listDirTool: ToolDefinition = {
     if (!fs.existsSync(fullPath)) return `Directory not found: ${dirPath}`;
 
     function listRecursive(dir: string, prefix = ''): string[] {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => {
+        if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
       const lines: string[] = [];
       for (const entry of entries) {
         if (IGNORE.has(entry.name)) continue;
@@ -440,7 +624,10 @@ export const listDirTool: ToolDefinition = {
 
     try {
       const lines = listRecursive(fullPath);
-      return lines.join('\n') || '(empty directory)';
+      return formatToolResult(`Listed ${dirPath}`, [
+        { label: 'Mode', content: recursive ? 'recursive' : 'top-level only' },
+        { label: 'Entries', content: lines.join('\n') || '(empty directory)' },
+      ]);
     } catch (err: any) {
       return `Error listing directory: ${err.message}`;
     }
@@ -475,6 +662,10 @@ export const readCodebaseTool: ToolDefinition = {
       if (totalSize > MAX_SIZE) return;
       let entries;
       try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      entries.sort((a, b) => {
+        if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
       for (const entry of entries) {
         if (totalSize > MAX_SIZE) break;
         const fullPath2 = path.join(dir, entry.name);
@@ -486,7 +677,7 @@ export const readCodebaseTool: ToolDefinition = {
           try {
             const content = fs.readFileSync(fullPath2, 'utf-8');
             const relPath = path.relative(fullRoot, fullPath2).replace(/\\/g, '/');
-            const snippet = `\n${'─'.repeat(60)}\n📄 ${relPath}\n${'─'.repeat(60)}\n${content}`;
+            const snippet = `\n${'─'.repeat(60)}\n📄 ${relPath}\n${'─'.repeat(60)}\n${addLineNumbers(content)}`;
             results.push(snippet);
             totalSize += snippet.length;
           } catch { /* skip */ }
@@ -496,7 +687,10 @@ export const readCodebaseTool: ToolDefinition = {
 
     walk(fullRoot);
     if (results.length === 0) return 'No source files found in that directory.';
-    return results.join('\n') + (totalSize > MAX_SIZE ? '\n\n[...codebase truncated at 200KB limit]' : '');
+    return formatToolResult(`Loaded codebase from ${dirPath}`, [
+      { label: 'Extensions', content: [...allowedExts].join(', ') },
+      { label: 'Contents', content: results.join('\n') + (totalSize > MAX_SIZE ? '\n\n[...codebase truncated at 200KB limit]' : '') },
+    ]);
   },
 };
 

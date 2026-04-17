@@ -8,6 +8,7 @@ type ErrorToken = { kind: 'error'; error: unknown };
 export interface TurnInterruptController {
   isInterrupted(): boolean;
   isHardCancelled(): boolean;
+  getSignal(): AbortSignal;
   run<T>(task: () => Promise<T>): Promise<{ cancelled: boolean; value?: T }>;
   stop(): void;
 }
@@ -17,6 +18,7 @@ export function createTurnInterruptController(): TurnInterruptController {
   let interrupted = false;
   let hardCancelled = false;
   const cancelWaiters = new Set<() => void>();
+  const abortController = new AbortController();
 
   const keypressHandler = (_str: string, key: any) => {
     if (!key || key.name !== 'escape') return;
@@ -28,6 +30,7 @@ export function createTurnInterruptController(): TurnInterruptController {
     }
 
     hardCancelled = true;
+    abortController.abort();
     process.stdout.write(chalk.red('\n  ✖ Request cancelled.\n'));
     for (const cancel of cancelWaiters) cancel();
     cancelWaiters.clear();
@@ -39,6 +42,7 @@ export function createTurnInterruptController(): TurnInterruptController {
   return {
     isInterrupted: () => interrupted,
     isHardCancelled: () => hardCancelled,
+    getSignal: () => abortController.signal,
     async run<T>(task: () => Promise<T>): Promise<{ cancelled: boolean; value?: T }> {
       if (hardCancelled) return { cancelled: true };
 
@@ -69,6 +73,9 @@ export function createTurnInterruptController(): TurnInterruptController {
     stop() {
       process.stdin.removeListener('keypress', keypressHandler);
       cancelWaiters.clear();
+      if (!abortController.signal.aborted && hardCancelled) {
+        abortController.abort();
+      }
     }
   };
 }
