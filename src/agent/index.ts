@@ -83,6 +83,14 @@ export async function runAgent(
   continuity.onUserInput(task.goal);
   const toolResultCache = new Map<string, string>();
 
+  const controller = new AbortController();
+  let timeoutTimer: NodeJS.Timeout | undefined;
+  if (task.timeoutMs && task.timeoutMs > 0) {
+    timeoutTimer = setTimeout(() => {
+      controller.abort();
+    }, task.timeoutMs);
+  }
+
   try {
     await executeHarnessTurn({
       provider,
@@ -101,6 +109,8 @@ export async function runAgent(
       toolCallsMade: io.toolCallCount,
       error: err.message || String(err),
     };
+  } finally {
+    if (timeoutTimer) clearTimeout(timeoutTimer);
   }
 
   // The summary is the accumulated assistant text (stripped of duplicate content)

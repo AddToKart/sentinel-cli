@@ -63,7 +63,43 @@ function normalizeDir(dir: string): string {
 }
 
 import fs from 'fs';
-import { isPathSensitive } from '../../tools/index.js';
+import { isPathSensitive, generateDiff } from '../../tools/index.js';
+import { renderDiff } from '../ui/rendering.js';
+
+function getDiffPreview(toolName: string, args: any): string | null {
+  const filePath = typeof args?.path === 'string' ? args.path : '';
+  if (!filePath) return null;
+  const fullPath = path.isAbsolute(filePath) ? filePath : path.join(process.cwd(), filePath);
+  if (!fs.existsSync(fullPath)) return null;
+
+  try {
+    const original = fs.readFileSync(fullPath, 'utf-8');
+    let updated = original;
+
+    if (toolName === 'write_file' && typeof args.content === 'string') {
+      updated = args.content;
+    } else if (toolName === 'edit_file') {
+      const editList: Array<{ old_string: string; new_string: string }> = args.edits?.length
+        ? args.edits
+        : (args.old_string !== undefined && args.new_string !== undefined ? [{ old_string: args.old_string, new_string: args.new_string }] : []);
+      for (const edit of editList) {
+        if (edit.old_string && edit.new_string && updated.includes(edit.old_string)) {
+          updated = updated.replace(edit.old_string, edit.new_string);
+        }
+      }
+    }
+
+    if (original === updated) return null;
+
+    const diff = generateDiff(original, updated, filePath, 2);
+    if (diff === '(no changes)') return null;
+
+    const lines = diff.split('\n');
+    return lines.slice(0, 18).join('\n');
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Trust a directory: write_file and edit_file for paths under this
@@ -169,6 +205,13 @@ export async function confirmTool(tool: any, args: any): Promise<boolean> {
   const summary = tool.getRiskSummary ? tool.getRiskSummary(args) : (tool.getLabel ? tool.getLabel(args) : tool.name);
   const isWriteTool = SAFE_TOOLS.has(toolName);
   const isTrusted = isPathInTrustedDir(args?.path);
+
+  if (isWriteTool) {
+    const diffText = getDiffPreview(toolName, args);
+    if (diffText) {
+      process.stdout.write(`\n  ${Style.header('Proposed Diff:')}\n${renderDiff(diffText)}\n\n`);
+    }
+  }
 
   const body = buildPanel('Confirm Action', [
     `${Style.dim('Action:')} ${Style.body(summary)}`,

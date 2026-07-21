@@ -32,11 +32,17 @@ export const SLASH_COMMANDS = [
   '/sandbox',
   '/trust',
   '/untrust',
+  '/undo',
   '/save',
+  '/export',
   '/load',
   '/init',
   '/clear',
   '/config',
+  '/update',
+  '/remember',
+  '/forget',
+  '/memories',
   '/exit',
   '/quit',
 ];
@@ -198,6 +204,52 @@ function buildFrame(state: InputState, width: number, statusLines?: string[]): {
   absCursorLine += lineWraps + (statusLines?.length ?? 0) + 1; // +1 for top border
 
   return { display: result, cursorLine: absCursorLine, cursorCol: absCursorCol };
+}
+
+// ─── Test Helper: Frame Builder ──────────────────────────────────────────
+export interface SmartInputFrameOptions {
+  width: number;
+  buffer: string;
+  statusLines?: string[];
+  mentionStart?: number;
+  mentionFiltered?: string[];
+  mentionSelectedIdx?: number;
+  commandFiltered?: string[];
+  commandSelectedIdx?: number;
+}
+
+export function buildSmartInputFrame(opts: SmartInputFrameOptions) {
+  const lines = opts.buffer.split('\n');
+  const state: InputState = {
+    lines,
+    cursorLine: lines.length - 1,
+    cursorCol: (lines[lines.length - 1] ?? '').length,
+    mentionStart: opts.mentionStart ?? -1,
+    mentionQuery: '',
+    mentionFiltered: opts.mentionFiltered ?? [],
+    mentionSelectedIdx: opts.mentionSelectedIdx ?? 0,
+    commandFiltered: opts.commandFiltered ?? [],
+    commandSelectedIdx: opts.commandSelectedIdx ?? 0,
+    selecting: false,
+    hasRendered: false,
+    inputHistory: [],
+    historyIdx: -1,
+    historyTempBuf: '',
+  };
+
+  const statusLines = opts.statusLines ?? [];
+  const frame = buildFrame(state, opts.width, statusLines);
+  const statusCount = statusLines.length;
+  const inputRowIndex = statusCount + 1;
+  const rowsBelowInput = frame.display.length - inputRowIndex - 1;
+
+  return {
+    lines: frame.display,
+    inputRowIndex,
+    rowsBelowInput,
+    cursorColumn: frame.cursorCol,
+    cursorLine: frame.cursorLine,
+  };
 }
 
 // ─── Main Input Function ─────────────────────────────────────────────────

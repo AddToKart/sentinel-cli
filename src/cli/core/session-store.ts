@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { getGlobalConfigPath } from '../../config/index.js';
 
 const SENTINEL_DIR = path.join(os.homedir(), '.sentinel');
 const HISTORY_DIR = path.join(SENTINEL_DIR, 'history');
@@ -86,11 +87,12 @@ export function getSentinelDir(): string {
 }
 
 /**
- * Check if this is a fresh install (no config exists yet).
+ * Returns true if no global or local configuration file exists.
  */
 export function isFreshInstall(): boolean {
-  const configPath = path.join(process.cwd(), '.sentinel.json');
-  return !fs.existsSync(configPath);
+  const globalConfig = getGlobalConfigPath();
+  const legacyConfig = path.join(process.cwd(), '.sentinel.json');
+  return !fs.existsSync(globalConfig) && !fs.existsSync(legacyConfig);
 }
 
 /**

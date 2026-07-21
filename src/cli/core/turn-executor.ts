@@ -6,7 +6,7 @@ import { ToolDefinition, ToolExecutionContext, ToolOutputChunk } from '../../too
 import { injectMentionedContextWithMetadata, MentionContextResult } from './context.js';
 import {
   HarnessMemory, TaskContinuityTracker, buildMemoryContext, buildPlanningRequest,
-  buildPolicyHints, buildSelfCritiquePrompt, injectHarnessContext, shouldSelfCritique, validateToolCall
+  buildPolicyHints, buildSelfCritiquePrompt, compressMessageHistory, injectHarnessContext, shouldSelfCritique, validateToolCall
 } from './intelligence.js';
 import { createTurnInterruptController } from './request-interrupt.js';
 import { COLORS, Style } from '../ui/theme.js';
@@ -246,7 +246,9 @@ export async function runPlanningPass(provider: AIProvider, messages: Message[],
       [...messages, { role: 'user', content: buildPlanningRequest(taskInput) }],
       [], { maxRetries: 1 }
     );
-    return planResp.content || '';
+    let plan = planResp.content || '';
+    plan = plan.replace(/<tool_calls>[\s\S]*?<\/tool_calls>/gi, '').trim();
+    return plan;
   } finally { stop(); }
 }
 
@@ -270,6 +272,12 @@ async function requestAssistantResponse(
 ): Promise<{ response?: ProviderResponse; cancelled: boolean; streamed: boolean }> {
   let response: ProviderResponse | undefined;
   let streamed = false;
+
+  const { messages: compressedMsgs, compressedCount } = compressMessageHistory(messages);
+  if (compressedCount > 0) {
+    io.showNotice(`Compacted ${compressedCount} older tool output(s) to preserve context window.`, 'dim');
+    messages.splice(0, messages.length, ...compressedMsgs);
+  }
 
   if (streamPreferred && provider.streamMessage) {
     io.beginAssistantStream();
@@ -387,7 +395,7 @@ async function executeToolCalls(
     if (call.name === 'read_file' && typeof call.args?.path === 'string') {
       const rp = normalizeTargetPath(call.args.path);
       if (autoLoadedPathSet.has(rp)) {
-        const msg = `Skipped read_file: ${call.args.path} was already loaded from @mention.`;
+        const msg = `Skipped read_file: ${call.args.path} was already loaded from your @mention.`;
         if (shouldPrintNotice(turnNoticeCache, `autoload:${rp}`)) io.showNotice(msg, 'dim');
         messages.push({ role: 'tool', content: msg, name: call.name, tool_call_id: call.id });
         memory.addToolResult(call.name, call.args, msg);

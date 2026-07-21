@@ -32,7 +32,19 @@ const configSchema = z.object({
 
 export type Config = z.infer<typeof configSchema>;
 
-const CONFIG_PATH = path.join(process.cwd(), '.sentinel.json');
+import os from 'os';
+
+export function getGlobalConfigDir(): string {
+  const dir = path.join(os.homedir(), '.sentinel');
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  return dir;
+}
+
+export function getGlobalConfigPath(): string {
+  return path.join(getGlobalConfigDir(), 'config.json');
+}
 
 // Fields that contain secrets and should be encrypted at rest
 const SECRET_CONFIG_KEYS = new Set([
@@ -118,9 +130,13 @@ export function loadConfig(): Config {
 
 function loadRawConfig(): RawConfig {
   let raw: RawConfig = {};
-  if (fs.existsSync(CONFIG_PATH)) {
+  const globalPath = getGlobalConfigPath();
+  const legacyPath = path.join(process.cwd(), '.sentinel.json');
+  const targetPath = fs.existsSync(globalPath) ? globalPath : fs.existsSync(legacyPath) ? legacyPath : globalPath;
+
+  if (fs.existsSync(targetPath)) {
     try {
-      raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+      raw = JSON.parse(fs.readFileSync(targetPath, 'utf-8'));
     } catch (e) {
       console.error('Error reading config file:', e);
     }
@@ -137,9 +153,10 @@ export function saveConfig(newConfig: Partial<Config>) {
   // Encrypt secrets before writing to disk
   encryptConfigValues(merged);
 
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2));
+  const targetPath = getGlobalConfigPath();
+  fs.writeFileSync(targetPath, JSON.stringify(merged, null, 2));
   // Restrict file permissions (best-effort on Windows)
-  try { fs.chmodSync(CONFIG_PATH, 0o600); } catch { /* Windows may not support chmod */ }
+  try { fs.chmodSync(targetPath, 0o600); } catch { /* Windows may not support chmod */ }
 }
 
 // ─── Custom Provider Management ──────────────────────────────────────────

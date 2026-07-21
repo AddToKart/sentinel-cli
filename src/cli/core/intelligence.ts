@@ -342,6 +342,7 @@ export function isHeavyTask(input: string): boolean {
 export function buildPlanningRequest(userInput: string): string {
   return [
     'Planning mode (harness-enforced): produce a concise execution plan before implementing.',
+    'CRITICAL: Tools are disabled during this planning pass. Do NOT output tool calls, function calls, or XML tags like <tool_calls>. Write plain-text markdown only.',
     'Return sections exactly as:',
     '1) Scope',
     '2) Plan',
@@ -371,7 +372,12 @@ export function buildPolicyHints(userInput: string): string[] {
   if (/\bbuild|test|compile|tsc|npm\b/i.test(userInput)) {
     hints.push('After code changes, run build/tests to verify behavior.');
   }
-  if (/\b(shell|command|terminal|powershell|bash|npm run|pnpm|yarn)\b/i.test(userInput)) {
+  if (/\b(html|css|js|javascript|typescript|ts|web|page|landing|ui|layout|element|tag|style|flex|grid|react|vue|svelte|next|vite|tailwind|express|node|prisma|api|route|backend)\b/i.test(userInput)) {
+    hints.push('Full-Stack Web Standards: Produce 100% complete, un-truncated, production-ready code. Use valid HTML5 semantics, responsive Flexbox/Grid layouts, clean CSS/Tailwind, and robust ES6+/TypeScript logic.');
+    hints.push('Web Bug Diagnosis: When fixing frontend or backend web issues, ALWAYS call read_file first to inspect target components, routes, or assets before editing.');
+    hints.push('Design & Aesthetics: Create modern, visually impressive UI designs with harmonious color schemes, smooth hover states, responsive layouts, and proper ARIA accessibility attributes.');
+  }
+  if (/\b(shell|command|terminal|powershell|bash|npm run|pnpm|yarn|bun)\b/i.test(userInput)) {
     hints.push('When using execute_shell, set cwd and timeout when the command scope is clear.');
   }
   return hints;
@@ -443,4 +449,48 @@ export function validateToolCall(call: { name: string; args: any }, toolDefs: an
     }
   }
   return null;
+}
+
+// ─── Dynamic Context Compression ──────────────────────────────────────────
+import { Message as IntelligenceMessage } from '../../providers/types.js';
+
+export function compressMessageHistory(messages: IntelligenceMessage[], maxTokenThreshold: number = 32000): { messages: IntelligenceMessage[]; compressedCount: number } {
+  const totalChars = messages.reduce((sum, m) => sum + (typeof m.content === 'string' ? m.content.length : 0), 0);
+  const approxTokens = Math.round(totalChars / 4);
+
+  if (approxTokens <= maxTokenThreshold) {
+    return { messages, compressedCount: 0 };
+  }
+
+  let compressedCount = 0;
+  const nonSystemIndices: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]?.role !== 'system') {
+      nonSystemIndices.push(i);
+    }
+  }
+
+  const preserveWindow = 6;
+  const eligibleIndices = new Set(nonSystemIndices.slice(0, Math.max(0, nonSystemIndices.length - preserveWindow)));
+
+  const nextMessages: IntelligenceMessage[] = messages.map((m, idx) => {
+    if (!eligibleIndices.has(idx)) return m;
+
+    if (m.role === 'tool' && typeof m.content === 'string' && m.content.length > 200) {
+      compressedCount++;
+      const lines = m.content.split('\n');
+      const firstLine = lines[0]?.trim() || '';
+      const charCount = m.content.length;
+      const toolName = m.name || 'tool';
+      const summaryContent = `[Summarized tool result for ${toolName}: ${lines.length} lines, ${charCount} chars. Initial output: ${firstLine.slice(0, 100)}...]`;
+      return {
+        ...m,
+        content: summaryContent,
+      };
+    }
+
+    return m;
+  });
+
+  return { messages: nextMessages, compressedCount };
 }

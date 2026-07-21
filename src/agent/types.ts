@@ -4,6 +4,8 @@ export interface AgentTask {
   context: string;
   mode: 'explore' | 'research';
   parentCwd: string;
+  maxSteps?: number | undefined;
+  timeoutMs?: number | undefined;
 }
 
 export interface AgentResult {

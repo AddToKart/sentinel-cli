@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "sentinel": "dist/index.js"
+    "sentinel": "bin/sentinel.js"
   },
   "author": "AddToKart",
   "license": "ISC",
@@ -22,7 +22,7 @@
     "dev": "node --disable-warning=DEP0205 --import tsx src/index.ts",
     "build": "tsc",
     "prepublishOnly": "npm run build",
-    "test": "node --import ./test/register-ts-node.mjs test/run.ts"
+    "test": "npx tsx test/run.ts"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
@@ -34,12 +34,10 @@
     "commander": "^14.0.3",
     "dotenv": "^17.4.2",
     "figures": "^6.1.0",
-    "inquirer": "^13.4.1",
     "ora": "^5.4.1",
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@types/inquirer": "^9.0.9",
     "@types/node": "^25.6.0",
     "nodemon": "^3.1.14",
     "ts-node": "^10.9.2",

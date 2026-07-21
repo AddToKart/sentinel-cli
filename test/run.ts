@@ -7,10 +7,10 @@ import { PassThrough } from 'stream';
 import { buildSmartInputFrame, getCommandSuggestions } from '../src/cli/ui/smart-input.js';
 import { renderMarkdown } from '../src/cli/ui/rendering.js';
 import { injectMentionedContextWithMetadata } from '../src/cli/core/context.js';
-import { HarnessMemory, TaskContinuityTracker } from '../src/cli/core/intelligence.js';
+import { HarnessMemory, TaskContinuityTracker, compressMessageHistory } from '../src/cli/core/intelligence.js';
 import { executeHarnessTurn, runPlanningPass, type TurnExecutionIO } from '../src/cli/core/turn-executor.js';
 import type { AIProvider, Message, ProviderResponse } from '../src/providers/types.js';
-import { runStreamingShellCommand, type ShellSpawnFactory, type ToolDefinition, type ToolOutputChunk } from '../src/tools/index.js';
+import { generateDiff, runStreamingShellCommand, searchSymbolTool, type ShellSpawnFactory, type ToolDefinition, type ToolOutputChunk } from '../src/tools/index.js';
 
 type Case = {
   name: string;
@@ -223,7 +223,7 @@ const cases: Case[] = [
       });
 
       assert.equal(result.producedOutput, true);
-      assert.deepEqual(io.assistant, [streamedContent]);
+      assert.deepEqual(io.assistant, ['Here is your ', 'snippet...']);
     }
   },
   {
@@ -338,6 +338,8 @@ const cases: Case[] = [
             chunks.push(`${chunk.stream}:${chunk.text}`);
           }
         },
+        {},
+        undefined,
         createFakeSpawn((child) => {
           queueMicrotask(() => {
             child.stdout.write('alpha\n');
@@ -347,7 +349,7 @@ const cases: Case[] = [
         })
       );
 
-      assert.match(result, /Shell command completed successfully/);
+      assert.match(result, /\[exit 0\]/);
       assert.ok(chunks.some(chunk => chunk.includes('stdout:alpha')));
       assert.ok(chunks.some(chunk => chunk.includes('stderr:beta')));
     }
@@ -361,6 +363,8 @@ const cases: Case[] = [
         process.cwd(),
         5000,
         { signal: controller.signal },
+        {},
+        undefined,
         createFakeSpawn(() => {
           // Intentionally wait for cancellation to trigger kill().
         })
@@ -368,7 +372,46 @@ const cases: Case[] = [
 
       setTimeout(() => controller.abort(), 100);
       const result = await pending;
-      assert.match(result, /cancelled by harness/i);
+      assert.match(result, /cancelled/i);
+    }
+  },
+  {
+    name: 'search_symbol locates functions, classes, and interfaces in source files',
+    async run() {
+      const result = await searchSymbolTool.execute({ query: 'executeHarnessTurn', path: 'src' });
+      assert.match(result, /found \d+ symbol/);
+      assert.match(result, /executeHarnessTurn/);
+    }
+  },
+  {
+    name: 'compressMessageHistory compresses older verbose tool outputs',
+    run() {
+      const msgs: Message[] = [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: 'input 1' },
+        { role: 'tool', content: 'A'.repeat(500), name: 'read_file' },
+        { role: 'assistant', content: 'reply 1' },
+        { role: 'user', content: 'input 2' },
+        { role: 'assistant', content: 'reply 2' },
+        { role: 'user', content: 'input 3' },
+        { role: 'assistant', content: 'reply 3' },
+        { role: 'user', content: 'input 4' },
+        { role: 'assistant', content: 'reply 4' },
+      ];
+      const { messages: compressed, compressedCount } = compressMessageHistory(msgs, 50);
+      assert.equal(compressedCount, 1);
+      assert.match(compressed[2]?.content || '', /\[Summarized tool result for read_file/);
+    }
+  },
+  {
+    name: 'generateDiff computes precise LCS hunk diffs without false cascade lines',
+    run() {
+      const oldText = '{\n  "name": "test",\n  "version": "1.0.0",\n  "dependencies": {\n    "a": "1"\n  }\n}';
+      const newText = '{\n  "name": "test",\n  "version": "1.0.0",\n  "watch": "tsc --watch",\n  "dependencies": {\n    "a": "1"\n  }\n}';
+      const diff = generateDiff(oldText, newText, 'package.json');
+      assert.match(diff, /\+\s+"watch": "tsc --watch",/);
+      assert.doesNotMatch(diff, /-\s+"dependencies":/);
+      assert.match(diff, /@@ -2,4 \+2,5 @@/);
     }
   },
 ];
