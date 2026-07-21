@@ -19,7 +19,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "dev": "tsx src/index.ts",
+    "dev": "node --disable-warning=DEP0205 --import tsx src/index.ts",
     "build": "tsc",
     "prepublishOnly": "npm run build",
     "test": "node --import ./test/register-ts-node.mjs test/run.ts"
@@ -43,7 +43,7 @@
     "@types/node": "^25.6.0",
     "nodemon": "^3.1.14",
     "ts-node": "^10.9.2",
-    "tsx": "^4.21.0",
+    "tsx": "^4.23.1",
     "typescript": "^6.0.2"
   }
 }

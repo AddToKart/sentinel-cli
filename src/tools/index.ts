@@ -100,7 +100,22 @@ function escapeRegex(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Detects AI omission placeholders that would truncate files
+// Check if ripgrep is available on the system
+let _rgAvailable: boolean | null = null;
+function isRgAvailable(): boolean {
+  if (_rgAvailable !== null) return _rgAvailable;
+  try { require('child_process').execSync('rg --version', { stdio: 'ignore', timeout: 2000 }); _rgAvailable = true; } catch { _rgAvailable = false; }
+  return _rgAvailable;
+}
+
+// Compact result: skip echoing input params the model already knows
+function compactResult(label: string, body: string): string {
+  return `${label}\n${body}`;
+}
+
+function grepResultCompact(mode: string, pattern: string, body: string): string {
+  return `grep(${mode}): "${pattern}"\n${body}`;
+}
 const OMISSION_PATTERNS = [
   /\/\/ \.\.\. existing/i, /\/\/ \.\.\. rest/i, /\/\/ \.\.\. previous/i,
   /\[existing code\]/i, /\[rest of (the )?file\]/i, /\[previous code\]/i,
@@ -115,6 +130,169 @@ function detectOmission(content: string): string | null {
   return null;
 }
 
+// ─── Security — Sensitive File Patterns ────────────────────────────────────
+// Files that should NEVER be written to by write_file or edit_file.
+export const SENSITIVE_FILE_PATTERNS: Array<{ pattern: RegExp; description: string }> = [
+  { pattern: /(^|\/|\\)\.env$/i, description: '.env file (secrets)' },
+  { pattern: /(^|\/|\\)\.env\.\w+$/i, description: '.env.* file (secrets)' },
+  { pattern: /(^|\/|\\)\.git[/\\]/i, description: '.git directory' },
+  { pattern: /(^|\/|\\)node_modules[/\\]/i, description: 'node_modules directory' },
+  { pattern: /(^|\/|\\)\.ssh[/\\]/i, description: '.ssh directory' },
+  { pattern: /(^|\/|\\)\.gnupg[/\\]/i, description: '.gnupg directory' },
+  { pattern: /(^|\/|\\)\.config[/\\]?$/i, description: '.config directory' },
+  { pattern: /(^|\/|\\)\.aws[/\\]/i, description: '.aws directory' },
+  { pattern: /(^|\/|\\)\.azure[/\\]/i, description: '.azure directory' },
+  { pattern: /(^|\/|\\)\.gcloud[/\\]/i, description: '.gcloud directory' },
+  { pattern: /(^|\/|\\)\.kube[/\\]/i, description: '.kube directory' },
+  { pattern: /(^|\/|\\)\.docker[/\\]/i, description: '.docker directory' },
+  { pattern: /(^|\/|\\)\.npmrc$/i, description: '.npmrc file' },
+  { pattern: /(^|\/|\\)\.gitconfig$/i, description: '.gitconfig file' },
+  { pattern: /(^|\/|\\)id_rsa$/i, description: 'SSH private key' },
+  { pattern: /(^|\/|\\)id_ed25519$/i, description: 'SSH private key' },
+  { pattern: /(^|\/|\\)authorized_keys$/i, description: 'authorized_keys file' },
+  { pattern: /(^|\/|\\)known_hosts$/i, description: 'known_hosts file' },
+  { pattern: /(^|\/|\\)\.sentinel\.json$/i, description: 'Sentinel config file' },
+  { pattern: /(^|\/|\\)sentinel[-.]key$/i, description: 'Sentinel encryption key' },
+  // Windows-specific sensitive paths
+  { pattern: /\\Windows\\System32\\/i, description: 'Windows System32 directory' },
+  { pattern: /\\Windows\\/i, description: 'Windows directory' },
+];
+
+// Helper to check if a path matches any sensitive pattern
+export function isPathSensitive(filePath: string): { sensitive: boolean; reason?: string } {
+  const normalized = filePath.replace(/\\/g, '/');
+  for (const { pattern, description } of SENSITIVE_FILE_PATTERNS) {
+    if (pattern.test(normalized)) {
+      return { sensitive: true, reason: description };
+    }
+  }
+  return { sensitive: false };
+}
+
+// ─── Security — Shell Command Blocklist ───────────────────────────────────
+// Commands that are extremely dangerous and should be blocked by default.
+// The AI model should never be allowed to run these.
+const DANGEROUS_COMMAND_PATTERNS: Array<{ pattern: RegExp; description: string }> = [
+  { pattern: /\brm\s+-rf\s+\/\s*$/i, description: 'rm -rf / (wipe entire filesystem)' },
+  { pattern: /\brm\s+-rf\s+~\s*$/i, description: 'rm -rf ~ (wipe home directory)' },
+  { pattern: /\brm\s+-rf\s+\.\s*$/i, description: 'rm -rf . (wipe current directory)' },
+  { pattern: /\brm\s+-rf\s+\*$/i, description: 'rm -rf * (wipe all files)' },
+  { pattern: /\brm\s+-rf\s+\/\s*\*/i, description: 'rm -rf /* (wipe everything)' },
+  { pattern: /\bdd\s+if=/i, description: 'dd (disk destroyer)' },
+  { pattern: /\bmkfs\./i, description: 'mkfs (format filesystem)' },
+  { pattern: /\bmke2fs/i, description: 'mke2fs (format filesystem)' },
+  { pattern: /\bformat\s+/i, description: 'format command' },
+  { pattern: /\bfdisk\s+/i, description: 'fdisk (partition editor)' },
+  { pattern: /\bchmod\s+-R\s+0{4}\s+\//i, description: 'chmod -R 000 /' },
+  { pattern: /\bchown\s+-R/i, description: 'chown -R (recursive ownership change)' },
+  { pattern: /\b>\s*\/dev\/sda/i, description: 'write to raw disk device' },
+  { pattern: /\bmv\s+\/\s+/i, description: 'mv / (move root directory)' },
+  { pattern: /\bshred\s+\/dev/i, description: 'shred (secure erase)' },
+  { pattern: /:\s*\(\)\s*\{\s*:\s*\|/i, description: 'fork bomb' },
+  { pattern: /\bwget\s+.+\|.*\bbash\b/i, description: 'wget pipe to bash (remote code execution)' },
+  { pattern: /\bcurl\s+.+\|.*\bbash\b/i, description: 'curl pipe to bash (remote code execution)' },
+];
+
+// Dangerous shell flags
+const DANGEROUS_FLAGS = ['--no-preserve-root', '--force', '-f', '--recursive', '-r'];
+
+function isDangerousCommand(command: string): { dangerous: boolean; reason?: string } {
+  for (const { pattern, description } of DANGEROUS_COMMAND_PATTERNS) {
+    if (pattern.test(command)) {
+      return { dangerous: true, reason: description };
+    }
+  }
+  return { dangerous: false };
+}
+
+// ─── Security — SSRF Protection ──────────────────────────────────────────
+// Private and reserved IP ranges that should not be accessible via web_fetch.
+const PRIVATE_IP_RANGES = [
+  { ip: '127.0.0.0/8', description: 'loopback' },
+  { ip: '10.0.0.0/8', description: 'private network' },
+  { ip: '172.16.0.0/12', description: 'private network' },
+  { ip: '192.168.0.0/16', description: 'private network' },
+  { ip: '169.254.0.0/16', description: 'link-local' },
+  { ip: '0.0.0.0/8', description: 'invalid address' },
+  { ip: '100.64.0.0/10', description: 'carrier-grade NAT' },
+  { ip: '198.18.0.0/15', description: 'benchmarking' },
+];
+
+// Cloud metadata IPs that should ALWAYS be blocked
+const BLOCKED_HOSTS = [
+  '169.254.169.254',  // AWS/GCP/Azure metadata
+  'metadata.google.internal',
+  '100.100.100.200',  // Alibaba Cloud metadata
+  'metadata.tencentyun.com',
+];
+
+function ipToLong(ip: string): number {
+  const parts = ip.split('.');
+  return ((+parts[0]! << 24) + (+parts[1]! << 16) + (+parts[2]! << 8) + (+parts[3]!)) >>> 0;
+}
+
+function cidrToRange(cidr: string): { start: number; end: number } {
+  const [ip, bits] = cidr.split('/');
+  const mask = ~(2 ** (32 - +bits!) - 1);
+  const ipLong = ipToLong(ip!);
+  return { start: ipLong & mask, end: ipLong | (~mask >>> 0) };
+}
+
+function isPrivateIP(hostname: string): boolean {
+  // Check blocked hosts first
+  if (BLOCKED_HOSTS.includes(hostname.toLowerCase())) return true;
+
+  // Check if it's an IP address
+  const ipMatch = hostname.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (!ipMatch) return false; // hostname, not IP — allow (DNS resolution happens at network level)
+
+  const ipLong = ipToLong(hostname);
+  for (const range of PRIVATE_IP_RANGES) {
+    const { start, end } = cidrToRange(range.ip);
+    if (ipLong >= start && ipLong <= end) return true;
+  }
+  return false;
+}
+
+// ─── Security — ReDoS-Safe Regex ─────────────────────────────────────────
+// Patterns known to be vulnerable to ReDoS (catastrophic backtracking)
+const REDOS_PATTERNS = [
+  /\(.+\)\+/,     // Nested quantifiers like (pattern)+
+  /\(.+\)\*/,     // Nested quantifiers like (pattern)*
+  /\(.+\)\{/,     // Nested quantifiers like (pattern){n,m}
+  /\[.*\]\+/,     // Character class with quantifier
+  /\+\+/,         // Double quantifier
+  /\*\*/,
+  /\?\+/,
+  /\?\*/,
+  /\+\*/,
+  /\*\+/,
+];
+
+function isSafeRegex(pattern: string): boolean {
+  // Check for known bad patterns
+  for (const redos of REDOS_PATTERNS) {
+    if (redos.test(pattern)) {
+      return false;
+    }
+  }
+  // Limit pattern length
+  if (pattern.length > 500) return false;
+  return true;
+}
+
+function compileSafeRegex(pattern: string, flags?: string): { regex: RegExp | null; error?: string } {
+  try {
+    // Check for dangerous patterns first
+    if (!isSafeRegex(pattern)) {
+      return { regex: null, error: 'Regex pattern too complex or potentially vulnerable to ReDoS. Simplify your search pattern.' };
+    }
+    return { regex: new RegExp(pattern, flags) };
+  } catch (err: any) {
+    return { regex: null, error: `Invalid regex: ${err.message}` };
+  }
+}
+
 function getFileIcon(ext: string): string {
   const icons: Record<string, string> = {
     '.ts': '📘', '.tsx': '📘', '.js': '📒', '.jsx': '📒',
@@ -124,6 +302,64 @@ function getFileIcon(ext: string): string {
     '.png': '🖼️', '.jpg': '🖼️', '.svg': '🖼️', '.gif': '🖼️',
   };
   return icons[ext.toLowerCase()] ?? '📄';
+}
+
+// Emoji-free variant — returned to the AI to save tokens
+function getFileLabel(ext: string): string {
+  const labels: Record<string, string> = {
+    '.ts': '.ts', '.tsx': '.tsx', '.js': '.js', '.jsx': '.jsx',
+    '.py': '.py', '.rs': '.rs', '.go': '.go', '.java': '.java',
+    '.css': '.css', '.html': '.html', '.json': '.json', '.md': '.md',
+    '.yaml': '.yaml', '.yml': '.yml', '.env': '.env', '.sh': '.sh',
+    '.png': 'img', '.jpg': 'img', '.svg': 'img', '.gif': 'img',
+  };
+  return (labels[ext.toLowerCase()] ?? ext.slice(1)) || 'txt';
+}
+
+// Strip emojis and Unicode symbols that waste tokens in tool results
+function stripEmojis(text: string): string {
+  return text.replace(/[\u{1F000}-\u{1FFFF}]|[\u{2600}-\u{27BF}]|[\u{2B00}-\u{2BFF}]/gu, '');
+}
+
+// Compress noisy shell output (npm progress, test results, build lines)
+function compressOutput(text: string): string {
+  const lines = text.split('\n');
+  if (lines.length < 10) return text;
+
+  // Detect known noisy patterns
+  let npmProgress = 0;
+  let npmResult = '';
+  const clean: string[] = [];
+  const warnings: string[] = [];
+  let passCount = 0;
+  let failCount = 0;
+
+  for (const line of lines) {
+    if (/^(added|removed|changed|packages|audited|found \d+)/i.test(line.trim())) {
+      npmResult = line.trim();
+      continue;
+    }
+    if (/^npm (WARN|ERR)/i.test(line) || /^\d+ warnings?/i.test(line)) {
+      warnings.push(line.trim());
+      continue;
+    }
+    if (/\bPASS\b/i.test(line) || /✓|✅|✔/.test(line)) { passCount++; continue; }
+    if (/\bFAIL\b/i.test(line) || /✗|❌|✘/.test(line)) { failCount++; continue; }
+    if (/\[.*\].*[█▓▒░].*\d+%/.test(line)) { npmProgress++; continue; } // progress bar
+    clean.push(line);
+  }
+
+  const parts: string[] = clean;
+  if (npmProgress > 0) parts.push(`[${npmProgress} progress lines skipped]`);
+  if (npmResult) parts.push(`npm summary: ${npmResult}`);
+  if (passCount || failCount) parts.push(`Tests: ${passCount} passed, ${failCount} failed`);
+  if (warnings.length) parts.push(`Warnings (${warnings.length}):\n${warnings.slice(0, 4).join('\n')}`);
+  return parts.join('\n');
+}
+
+// Strip ANSI escape sequences from shell output before sending to AI
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-9;]*m/g, '').replace(/\x1b\]0;.*?\x07/g, '');
 }
 
 /** Generate a simple inline diff between old and new content */
@@ -163,13 +399,15 @@ export function generateDiff(oldContent: string, newContent: string, filePath: s
 export const shellTool: ToolDefinition = {
   name: 'execute_shell',
   displayName: 'Shell',
-  description: 'Execute a shell command on the local machine. Use for running scripts, installing packages, compiling code, etc.',
+  description: 'Execute a shell command. Use for scripts, package managers, build tools, git, tests.',
   parameters: {
     type: 'object',
     properties: {
       command: { type: 'string', description: 'The shell command to run' },
-      cwd: { type: 'string', description: 'Working directory to run the command from (default: current directory)' },
-      timeout_ms: { type: 'number', description: 'Timeout in milliseconds (default: 30000, max: 120000)' },
+      cwd: { type: 'string', description: 'Working directory (default: current directory)' },
+      timeout_ms: { type: 'number', description: 'Timeout in ms (default 30000, max 120000)' },
+      log_tail: { type: 'number', description: 'Return only the last N lines of output. Use for long output.' },
+      env: { type: 'object', description: 'Extra env vars (e.g. {"NODE_ENV":"test"})' },
     },
     required: ['command'],
   },
@@ -181,13 +419,15 @@ export const shellTool: ToolDefinition = {
     if (timeout_ms) parts.push(`timeout=${timeout_ms}ms`);
     return parts.join(' | ');
   },
-  async execute({ command, cwd, timeout_ms }, context = {}) {
+  async execute({ command, cwd, timeout_ms, log_tail, env }, context = {}) {
     const workingDir = cwd ? resolvePath(cwd) : process.cwd();
     if (!fs.existsSync(workingDir)) return `Error: working directory not found: ${cwd}`;
-    if (!fs.statSync(workingDir).isDirectory()) return `Error: working directory is not a directory: ${cwd}`;
-
+    if (!fs.statSync(workingDir).isDirectory()) return `Error: not a directory: ${cwd}`;
+    const dangerCheck = isDangerousCommand(command);
+    if (dangerCheck.dangerous) return `Blocked: ${dangerCheck.reason}`;
     const timeout = Math.max(1000, Math.min(Number(timeout_ms) || 30000, 120000));
-    return runStreamingShellCommand(command, workingDir, timeout, context);
+    const extraEnv = env && typeof env === 'object' ? env : {};
+    return runStreamingShellCommand(command, workingDir, timeout, context, extraEnv, log_tail ? Number(log_tail) : undefined);
   },
 };
 
@@ -196,6 +436,8 @@ export function runStreamingShellCommand(
   workingDir: string,
   timeout: number,
   context: ToolExecutionContext = {},
+  extraEnv: Record<string, string> = {},
+  logTail?: number,
   spawnFactory: ShellSpawnFactory = (cmd, options) => spawn(cmd, options)
 ): Promise<string> {
   const maxCapture = 1024 * 256;
@@ -207,11 +449,12 @@ export function runStreamingShellCommand(
     let aborted = false;
     let settled = false;
 
+    const childEnv = { ...process.env, ...extraEnv };
     const child = spawnFactory(command, {
       cwd: workingDir,
       shell: true,
       windowsHide: true,
-      env: process.env,
+      env: childEnv,
     });
 
     const finish = (result: string) => {
@@ -258,29 +501,48 @@ export function runStreamingShellCommand(
     child.stderr?.on('data', (chunk) => emitChunk('stderr', chunk));
 
     child.on('error', (err) => {
-      finish(formatToolResult('Shell command failed to start.', [
-        { label: 'Command', content: command },
-        { label: 'Working directory', content: workingDir },
-        { label: 'Error', content: err.message },
-      ]));
+      finish(`Shell error: ${err.message}`);
     });
 
     child.on('close', (code, signal) => {
-      const statusLabel = timedOut
-        ? `Shell command timed out after ${timeout}ms.`
-        : aborted
-          ? 'Shell command cancelled by harness.'
-          : code === 0
-            ? 'Shell command completed successfully.'
-            : `Shell command failed with exit code ${code ?? '?'}${signal ? ` (signal: ${signal})` : ''}.`;
+      const status = timedOut ? `timed out (${timeout}ms)`
+        : aborted ? 'cancelled'
+        : code === 0 ? `exit 0`
+        : `exit ${code ?? '?'}${signal ? ` (signal: ${signal})` : ''}`;
 
-      finish(formatToolResult(statusLabel, [
-        { label: 'Command', content: command },
-        { label: 'Working directory', content: workingDir },
-        { label: 'Stdout', content: formatCodeBlock('text', truncateText(stdout || '(no stdout)', 12000)) },
-        { label: 'Stderr', content: formatCodeBlock('text', truncateText(stderr || '(no stderr)', 12000)) },
-      ]));
+      let out = stripAnsi(stdout ? compressOutput(stdout) : '');
+      let err = stripAnsi(stderr ? compressOutput(stderr) : '');
+
+      // log_tail: return only the last N lines
+      if (logTail && logTail > 0) {
+        const tail = (s: string) => { const ls = s.split('\n'); return ls.slice(-logTail).join('\n'); };
+        out = tail(out);
+        err = tail(err);
+      }
+
+      // Compact: no "Command"/"Working directory" echo (model already knows)
+      let result = `[${status}]`;
+      if (out) result += `\n${out}`;
+      if (err) result += `\nstderr:\n${formatCodeBlock('text', truncateText(err, 8000))}`;
+      if (!out && !err) result += '\n(no output)';
+      finish(result);
     });
+  });
+}
+
+// ─── Security — Sensitive File Read Prompt ───────────────────────────────
+function promptSensitiveFileRead(filePath: string, reason: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    process.stdout.write(`\n  ⚠ ${reason} detected: ${filePath}\n`);
+    process.stdout.write(`  ${chalk.dim('?')} Read this file anyway? ${chalk.dim('[y/N]: ')}`);
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+    rl.once('line', (answer) => {
+      rl.close();
+      const normalized = answer.trim().toLowerCase();
+      resolve(normalized === 'y' || normalized === 'yes');
+    });
+    // Timeout after 30s — default to no
+    setTimeout(() => { try { rl.close(); } catch {} resolve(false); }, 30000);
   });
 }
 
@@ -288,29 +550,43 @@ export function runStreamingShellCommand(
 export const readFileTool: ToolDefinition = {
   name: 'read_file',
   displayName: 'Reading',
-  description: 'Read the full contents of a file.',
+  description: 'Read a file. Use offset/limit to read specific sections without loading entire large files.',
   parameters: {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'Path to the file (relative to cwd or absolute)' },
+      offset: { type: 'number', description: 'Start reading from this line number (1-indexed, default: 1)' },
+      limit: { type: 'number', description: 'Maximum number of lines to read (default: all)' },
     },
     required: ['path'],
   },
-  getLabel: ({ path: p }) => p,
-  async execute({ path: filePath }) {
+  getLabel: ({ path: p, offset, limit }) =>
+    `${p}${offset ? ` L${offset}` : ''}${limit ? `+${limit}` : ''}`,
+  async execute({ path: filePath, offset, limit }) {
     try {
       const fullPath = resolvePath(filePath);
+      const sensitiveCheck = isPathSensitive(fullPath);
+      if (sensitiveCheck.sensitive) {
+        const allow = await promptSensitiveFileRead(filePath, sensitiveCheck.reason!);
+        if (!allow) return `Skipped: ${filePath} requires approval (${sensitiveCheck.reason}).`;
+      }
       if (!fs.existsSync(fullPath)) return `File not found: ${filePath}`;
       const stat = fs.statSync(fullPath);
-      if (stat.size > 1024 * 1024) return `File too large (${(stat.size / 1024).toFixed(0)} KB). Use read_codebase for directories.`;
+      if (stat.size > 1024 * 1024 * 2) return `File too large (${(stat.size / 1024).toFixed(0)} KB). Use offset/limit.`;
       const content = fs.readFileSync(fullPath, 'utf-8');
-      const numbered = addLineNumbers(content);
-      return formatToolResult(`Read ${filePath}`, [
-        { label: 'Metadata', content: `${content.split('\n').length} lines | ${formatBytes(stat.size)}` },
-        { label: 'Contents', content: formatCodeBlock(path.extname(filePath).slice(1) || 'text', numbered) },
-      ]);
+      const allLines = content.split('\n');
+      const start = Math.max(0, (Number(offset) || 1) - 1);
+      const end = limit ? Math.min(allLines.length, start + Number(limit)) : allLines.length;
+      const sliced = allLines.slice(start, end);
+      const numbered = sliced.map((line, idx) =>
+        `${String(start + idx + 1).padStart(String(end).length, ' ')}|${line}`
+      ).join('\n');
+      const range = offset || limit
+        ? ` (lines ${start + 1}-${end} of ${allLines.length})`
+        : ` (${allLines.length} lines, ${formatBytes(stat.size)})`;
+      return `read_file: ${filePath}${range}\n\`\`\`${path.extname(filePath).slice(1) || 'text'}\n${numbered}\n\`\`\``;
     } catch (err: any) {
-      return `Error reading file: ${err.message}`;
+      return `Error: ${err.message}`;
     }
   },
 };
@@ -334,6 +610,13 @@ export const writeFileTool: ToolDefinition = {
   async execute({ path: filePath, content }) {
     try {
       const fullPath = resolvePath(filePath);
+
+      // Security: block writes to sensitive paths
+      const sensitiveCheck = isPathSensitive(fullPath);
+      if (sensitiveCheck.sensitive) {
+        return `⚠ Blocked by security policy: Cannot write to ${sensitiveCheck.reason} (${filePath}). This path is protected.`;
+      }
+
       // Omission guard
       const omission = detectOmission(content);
       if (omission) {
@@ -359,53 +642,65 @@ export const writeFileTool: ToolDefinition = {
 export const editFileTool: ToolDefinition = {
   name: 'edit_file',
   displayName: 'Editing',
-  description: 'Make a targeted find-and-replace edit to an existing file. Safer than write_file for modifying existing code. Use exact strings that appear in the file.',
+  description: 'Make targeted find-and-replace edits. For multiple edits to the same file, use `edits` array: `[{old_string, new_string}, ...]`. Each old_string must be unique in the file.',
   parameters: {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'Path to the file to edit' },
-      old_string: { type: 'string', description: 'The exact string to find and replace. Must be unique in the file.' },
-      new_string: { type: 'string', description: 'The replacement string.' },
+      old_string: { type: 'string', description: 'The exact string to find and replace (for single edit)' },
+      new_string: { type: 'string', description: 'The replacement string (for single edit)' },
+      edits: { type: 'array', items: { type: 'object', properties: { old_string: { type: 'string' }, new_string: { type: 'string' } }, required: ['old_string', 'new_string'] }, description: 'Array of {old_string, new_string} for multiple edits to the same file' },
     },
-    required: ['path', 'old_string', 'new_string'],
+    required: ['path'],
   },
   requiresConfirmation: true,
-  getLabel: ({ path: p }) => p,
-  getRiskSummary: ({ path: p, old_string, new_string }) =>
-    `Edit ${p}: replace "${String(old_string).split('\n')[0]?.slice(0, 40) ?? ''}..." → "${String(new_string).split('\n')[0]?.slice(0, 40) ?? ''}..."`,
-  async execute({ path: filePath, old_string, new_string }) {
+  getLabel: ({ path: p, edits }) => `${p} (${edits?.length ?? 1} edit(s))`,
+  getRiskSummary: ({ path: p, old_string, new_string, edits }) => {
+    if (edits?.length) return `Edit ${p}: ${edits.length} replacements`;
+    return `Edit ${p}: replace "${String(old_string).split('\n')[0]?.slice(0, 40) ?? ''}..."`;
+  },
+  async execute({ path: filePath, old_string, new_string, edits }: {
+    path: string; old_string?: string; new_string?: string;
+    edits?: Array<{ old_string: string; new_string: string }>;
+  }) {
     try {
       const fullPath = resolvePath(filePath);
+      const sensitiveCheck = isPathSensitive(fullPath);
+      if (sensitiveCheck.sensitive) return `Blocked: cannot edit ${sensitiveCheck.reason} (${filePath}).`;
       if (!fs.existsSync(fullPath)) return `File not found: ${filePath}`;
-      // Omission guard on new_string
-      const omission = detectOmission(new_string);
-      if (omission) {
-        return `⚠ Blocked: new_string contains an omission placeholder ("${omission}"). Provide the complete replacement.`;
-      }
+
       const original = fs.readFileSync(fullPath, 'utf-8');
       const fileEol = detectEol(original);
-      if (normalizeNewlines(old_string) === normalizeNewlines(new_string)) {
-        return `Skipped edit_file: replacement text is identical for ${filePath}.`;
-      }
 
-      const oldCandidates = [old_string, withEol(old_string, fileEol)].filter((v, i, arr) => arr.indexOf(v) === i);
-      const matchedOld = oldCandidates.find(candidate => original.includes(candidate));
-      if (!matchedOld) {
-        const newCandidates = [new_string, withEol(new_string, fileEol)].filter((v, i, arr) => arr.indexOf(v) === i);
-        if (newCandidates.some(candidate => original.includes(candidate))) {
-          return `Skipped edit_file: ${filePath} already has the requested content.`;
+      // Normalize: support edits array or single old/new
+      const editList: Array<{ old_string: string; new_string: string }> = edits?.length
+        ? edits
+        : (old_string !== undefined && new_string !== undefined ? [{ old_string, new_string }] : []);
+      if (editList.length === 0) return 'Error: provide either (old_string + new_string) or edits array.';
+
+      // Validate and collect replacements
+      const replacements: Array<{ old: string; nw: string }> = [];
+      for (const edit of editList) {
+        const omission = detectOmission(edit.new_string);
+        if (omission) return `Blocked: new_string contains omission placeholder ("${omission}").`;
+        if (normalizeNewlines(edit.old_string) === normalizeNewlines(edit.new_string)) continue;
+        const candidates = [edit.old_string, withEol(edit.old_string, fileEol)].filter((v, i, arr) => arr.indexOf(v) === i);
+        const matched = candidates.find(c => original.includes(c));
+        if (!matched) {
+          const newCands = [edit.new_string, withEol(edit.new_string, fileEol)].filter((v, i, arr) => arr.indexOf(v) === i);
+          if (newCands.some(c => original.includes(c))) continue; // Already applied — skip
+          return `Error: old_string not found in ${filePath}: "${edit.old_string.slice(0, 80)}..."`;
         }
-        return `Error: old_string not found in ${filePath}. Ensure the string exactly matches the file contents.`;
+        const occurrences = original.split(matched).length - 1;
+        if (occurrences > 1) return `Error: old_string appears ${occurrences} times: "${edit.old_string.slice(0, 60)}...". Make it more specific.`;
+        replacements.push({ old: matched, nw: withEol(edit.new_string, fileEol) });
       }
+      if (replacements.length === 0) return `Skipped: ${filePath} already has the requested content.`;
 
-      const occurrences = original.split(matchedOld).length - 1;
-      if (occurrences > 1) return `Error: old_string appears ${occurrences} times in ${filePath}. Provide a more specific string.`;
-
-      const replacement = withEol(new_string, fileEol);
-      const updated = original.replace(matchedOld, replacement);
-      if (updated === original) return `Skipped edit_file: ${filePath} already has the requested content.`;
+      let updated = original;
+      for (const { old, nw } of replacements) updated = updated.replace(old, nw);
       fs.writeFileSync(fullPath, updated, 'utf-8');
-      return `Edited ${filePath} successfully.\n${generateDiff(original, updated, filePath)}`;
+      return `Edited ${filePath} (${replacements.length} change(s)).\n${generateDiff(original, updated, filePath)}`;
     } catch (err: any) {
       return `Error editing file: ${err.message}`;
     }
@@ -416,58 +711,96 @@ export const editFileTool: ToolDefinition = {
 export const grepTool: ToolDefinition = {
   name: 'grep',
   displayName: 'Searching',
-  description: 'Search for a pattern in file contents. Like ripgrep/grep. Returns matching lines with file and line number.',
+  description: 'Search files for a pattern. Supports output_mode: content (default), files (filenames only), count (match counts per file). Use max_results to cap. Use context for surrounding lines.',
   parameters: {
     type: 'object',
     properties: {
       pattern: { type: 'string', description: 'String or regex pattern to search for' },
-      path: { type: 'string', description: 'File or directory to search in (default: cwd)' },
-      case_insensitive: { type: 'boolean', description: 'Case-insensitive search (default: false)' },
-      include: { type: 'string', description: 'Only search files matching this glob (e.g. "*.ts")' },
+      path: { type: 'string', description: 'File or directory to search (default: cwd)' },
+      case_insensitive: { type: 'boolean', description: 'Case-insensitive (default: false)' },
+      include: { type: 'string', description: 'Only search files matching glob (e.g. "*.ts")' },
+      max_results: { type: 'number', description: 'Max matching lines to return (default: 200)' },
+      context: { type: 'number', description: 'Lines of context before/after each match (like grep -C)' },
+      output_mode: { type: 'string', description: 'content|files|count. files = just filenames. count = match counts per file.' },
     },
     required: ['pattern'],
   },
   getLabel: ({ pattern, path: p }) => `"${pattern}" in ${p || '.'}`,
-  async execute({ pattern, path: searchPath = '.', case_insensitive = false, include }: {
-    pattern: string; path?: string; case_insensitive?: boolean; include?: string;
+  async execute({ pattern, path: searchPath = '.', case_insensitive = false, include, max_results = 200, context = 0, output_mode = 'content' }: {
+    pattern: string; path?: string; case_insensitive?: boolean; include?: string; max_results?: number; context?: number; output_mode?: string;
   }) {
-    const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__']);
+    const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', 'coverage', '.cache', '.tmp-dist']);
     const fullRoot = resolvePath(searchPath);
     let regex: RegExp;
     let mode = 'regex';
-    try {
-      regex = new RegExp(pattern, case_insensitive ? 'gi' : 'g');
-    } catch {
-      regex = new RegExp(escapeRegex(pattern), case_insensitive ? 'gi' : 'g');
-      mode = 'literal';
+
+    const compiled = compileSafeRegex(pattern, case_insensitive ? 'gi' : 'g');
+    if (compiled.regex) { regex = compiled.regex; }
+    else {
+      const literalCompiled = compileSafeRegex(escapeRegex(pattern), case_insensitive ? 'gi' : 'g');
+      if (literalCompiled.regex) { regex = literalCompiled.regex; mode = 'literal'; }
+      else { return `Error: ${compiled.error || 'Invalid pattern'}`; }
     }
+
+    // Try ripgrep first for speed
+    if (isRgAvailable() && !context && output_mode === 'content') {
+      try {
+        const rgArgs = ['--no-heading', '--line-number', '-m', String(max_results),
+          ...(case_insensitive ? ['-i'] : []),
+          ...(include ? ['-g', include] : []),
+          '-e', pattern, fullRoot];
+        const result = require('child_process').execSync(`rg ${rgArgs.join(' ')}`, { timeout: 15000, encoding: 'utf-8', maxBuffer: 1024 * 1024 });
+        const lines = result.trim().split('\n');
+        const compact = lines.map((l: string) => {
+          const [file, ...rest] = l.split(':');
+          return `${path.relative(fullRoot, file!).replace(/\\/g, '/')}:${rest?.join(':')?.trim() ?? ''}`;
+        }).join('\n');
+        return grepResultCompact(mode, pattern, compact || '(no matches)');
+      } catch (e: any) {
+        if (e.status === 1) return grepResultCompact(mode, pattern, '(no matches)');
+        // Fall through to JS walker on error
+      }
+    }
+
     const results: string[] = [];
-    let fileCount = 0;
+    const fileMatches = new Map<string, string[]>();
+    let totalMatches = 0;
 
     const includeExt = include ? include.replace('*', '').replace('**/', '') : null;
 
     function walk(dir: string) {
+      if (totalMatches >= (max_results ?? 200)) return;
       let entries;
       try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
       for (const entry of entries) {
+        if (totalMatches >= (max_results ?? 200)) break;
         const fullPath = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (!IGNORE_DIRS.has(entry.name)) walk(fullPath);
-        } else if (entry.isFile()) {
+        if (entry.isDirectory()) { if (!IGNORE_DIRS.has(entry.name)) walk(fullPath); }
+        else if (entry.isFile()) {
           if (includeExt && !entry.name.endsWith(includeExt)) continue;
           try {
             const content = fs.readFileSync(fullPath, 'utf-8');
-            const lines = content.split('\n');
             const relPath = path.relative(fullRoot, fullPath).replace(/\\/g, '/');
-            let matched = false;
-            lines.forEach((line, idx) => {
-              if (regex.test(line)) {
-                if (!matched) { results.push(`\n📄 ${relPath}`); matched = true; fileCount++; }
-                results.push(`  ${String(idx + 1).padStart(4, ' ')} │ ${line.trim()}`);
+            const lines = content.split('\n');
+            let fileHits: string[] = [];
+            for (let i = 0; i < lines.length && totalMatches < (max_results ?? 200); i++) {
+              if (regex.test(lines[i] ?? '')) {
+                totalMatches++;
+                if (context && context > 0) {
+                  const start = Math.max(0, i - context);
+                  const end = Math.min(lines.length, i + context + 1);
+                  for (let j = start; j < end; j++) {
+                    const marker = j === i ? '>' : ' ';
+                    fileHits.push(`${marker}${String(j + 1).padStart(4)} ${(lines[j] ?? '').trim()}`);
+                  }
+                } else {
+                  fileHits.push(`${String(i + 1).padStart(5)} ${(lines[i] ?? '').trim()}`);
+                }
               }
               regex.lastIndex = 0;
-            });
-          } catch { /* skip binary */ }
+            }
+            if (fileHits.length > 0) fileMatches.set(relPath, fileHits);
+          } catch { /* skip */ }
         }
       }
     }
@@ -477,24 +810,35 @@ export const grepTool: ToolDefinition = {
       if (stat.isFile()) {
         const content = fs.readFileSync(fullRoot, 'utf-8');
         const lines = content.split('\n');
-        lines.forEach((line, idx) => {
-          if (regex.test(line)) {
-            results.push(`  ${String(idx + 1).padStart(4, ' ')} │ ${line.trim()}`);
+        let fileHits: string[] = [];
+        for (let i = 0; i < lines.length && totalMatches < (max_results ?? 200); i++) {
+          if (regex.test(lines[i] ?? '')) {
+            totalMatches++;
+            fileHits.push(`${String(i + 1).padStart(5)} ${(lines[i] ?? '').trim()}`);
             regex.lastIndex = 0;
           }
-        });
-      } else {
-        walk(fullRoot);
-      }
-    } catch (err: any) {
-      return `Error: ${err.message}`;
-    }
+        }
+        if (fileHits.length > 0) fileMatches.set(path.relative(fullRoot, fullRoot).replace(/\\/g, '/') || path.basename(fullRoot), fileHits);
+      } else { walk(fullRoot); }
+    } catch (err: any) { return `Error: ${err.message}`; }
 
-    if (results.length === 0) return `No matches found for "${pattern}"`;
-    return formatToolResult(`Found matches in ${fileCount} file(s).`, [
-      { label: 'Pattern', content: `${pattern} (${mode}${case_insensitive ? ', case-insensitive' : ''})` },
-      { label: 'Results', content: results.join('\n') },
-    ]);
+    if (fileMatches.size === 0) return grepResultCompact(mode, pattern, '(no matches)');
+
+    // Build output based on mode
+    if (output_mode === 'files') {
+      return grepResultCompact(mode, pattern, [...fileMatches.keys()].join('\n'));
+    }
+    if (output_mode === 'count') {
+      const counts = [...fileMatches.entries()].map(([f, h]) => `${h.length}  ${f}`);
+      return grepResultCompact(mode, pattern, counts.join('\n'));
+    }
+    // content mode
+    const out: string[] = [];
+    for (const [f, lines] of fileMatches) {
+      out.push(`${f}:`);
+      out.push(lines.join('\n'));
+    }
+    return grepResultCompact(mode, pattern, out.join('\n'));
   },
 };
 
@@ -513,7 +857,7 @@ export const globTool: ToolDefinition = {
   },
   getLabel: ({ pattern, path: p }) => `${pattern} in ${p || '.'}`,
   async execute({ pattern, path: rootPath = '.' }: { pattern: string; path?: string }) {
-    const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__']);
+    const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', 'coverage', '.cache', '.tmp-dist']);
     const fullRoot = resolvePath(rootPath);
     const results: string[] = [];
 
@@ -524,7 +868,9 @@ export const globTool: ToolDefinition = {
       .replace(/\*/g, '[^/]*')
       .replace(/__DOUBLE__/g, '.*')
       .replace(/\?/g, '[^/]');
-    const regex = new RegExp(`^${regexStr}$`);
+    const globCompiled = compileSafeRegex(`^${regexStr}$`);
+    if (!globCompiled.regex) return `Error: ${globCompiled.error || 'invalid pattern'}`;
+    const regex = globCompiled.regex;
 
     function walk(dir: string) {
       let entries;
@@ -532,20 +878,16 @@ export const globTool: ToolDefinition = {
       for (const entry of entries) {
         const fullPath = path.join(dir, entry.name);
         const relPath = path.relative(fullRoot, fullPath).replace(/\\/g, '/');
-        if (entry.isDirectory()) {
-          if (!IGNORE_DIRS.has(entry.name)) walk(fullPath);
-        } else if (entry.isFile()) {
-          if (regex.test(relPath) || regex.test(entry.name)) {
-            const ext = path.extname(entry.name);
-            results.push(`${getFileIcon(ext)} ${relPath}`);
-          }
+        if (entry.isDirectory()) { if (!IGNORE_DIRS.has(entry.name)) walk(fullPath); }
+        else if (entry.isFile()) {
+          if (regex.test(relPath) || regex.test(entry.name)) results.push(relPath);
         }
       }
     }
 
     walk(fullRoot);
-    if (results.length === 0) return `No files matched pattern: ${pattern}`;
-    return `${results.length} file(s) matched:\n${results.join('\n')}`;
+    if (results.length === 0) return `glob: no files matched "${pattern}"`;
+    return `${results.length} files matched "${pattern}":\n${results.join('\n')}`;
   },
 };
 
@@ -553,7 +895,7 @@ export const globTool: ToolDefinition = {
 export const webFetchTool: ToolDefinition = {
   name: 'web_fetch',
   displayName: 'Fetching',
-  description: 'Fetch the content of a URL. Use to retrieve documentation, API responses, or web pages as context.',
+  description: 'Fetch a URL. Auto-detects content type: strips HTML tags, preserves JSON, wraps plain text.',
   parameters: {
     type: 'object',
     properties: {
@@ -564,20 +906,37 @@ export const webFetchTool: ToolDefinition = {
   getLabel: ({ url }) => url,
   async execute({ url }) {
     try {
+      const parsedUrl = new URL(url);
+      const hostname = parsedUrl.hostname;
+      if (isPrivateIP(hostname)) {
+        return `Blocked: ${hostname} is a private/internal address (SSRF protection).`;
+      }
+
       const response = await axios.get(url, {
         timeout: 15000,
         headers: { 'User-Agent': 'Sentinel-CLI/1.0' },
         responseType: 'text',
       });
       const text: string = typeof response.data === 'string' ? response.data : JSON.stringify(response.data, null, 2);
-      // Strip excessive HTML tags if it's HTML
-      const stripped = text
-        .replace(/<script[\s\S]*?<\/script>/gi, '')
-        .replace(/<style[\s\S]*?<\/style>/gi, '')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/\s{3,}/g, '\n')
-        .trim();
-      const truncated = stripped.length > 8000 ? stripped.slice(0, 8000) + '\n\n[...truncated at 8000 chars]' : stripped;
+      const contentType = String(response.headers['content-type'] || '');
+
+      let result: string;
+      if (contentType.includes('html')) {
+        result = text
+          .replace(/<script[\s\S]*?<\/script>/gi, '')
+          .replace(/<style[\s\S]*?<\/style>/gi, '')
+          .replace(/<nav[\s\S]*?<\/nav>/gi, '')
+          .replace(/<header[\s\S]*?<\/header>/gi, '')
+          .replace(/<footer[\s\S]*?<\/footer>/gi, '')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s{3,}/g, '\n')
+          .trim();
+      } else if (contentType.includes('json')) {
+        result = text; // Already JSON — keep as-is
+      } else {
+        result = text; // Plain text or unknown
+      }
+      const truncated = result.length > 8000 ? result.slice(0, 8000) + '\n[...truncated at 8000 chars]' : result;
       return truncated;
     } catch (err: any) {
       return `Error fetching ${url}: ${err.message}`;
@@ -589,18 +948,18 @@ export const webFetchTool: ToolDefinition = {
 export const listDirTool: ToolDefinition = {
   name: 'list_directory',
   displayName: 'Listing',
-  description: 'List files and directories in a given path. Use to explore project structure.',
+  description: 'List files and directories. Use to explore project structure.',
   parameters: {
     type: 'object',
     properties: {
-      path: { type: 'string', description: 'Directory path to list (default: current directory)' },
+      path: { type: 'string', description: 'Directory to list (default: current directory)' },
       recursive: { type: 'boolean', description: 'List recursively? Default false.' },
     },
     required: [],
   },
   getLabel: ({ path: p }) => p || '.',
   async execute({ path: dirPath = '.', recursive = false }) {
-    const IGNORE = new Set(['node_modules', '.git', 'dist', '.next', '__pycache__', '.DS_Store']);
+    const IGNORE = new Set(['node_modules', '.git', 'dist', '.next', '__pycache__', '.DS_Store', 'coverage', '.cache', '.tmp-dist']);
     const fullPath = resolvePath(dirPath);
     if (!fs.existsSync(fullPath)) return `Directory not found: ${dirPath}`;
 
@@ -611,12 +970,12 @@ export const listDirTool: ToolDefinition = {
       });
       const lines: string[] = [];
       for (const entry of entries) {
-        if (IGNORE.has(entry.name)) continue;
+        if (IGNORE.has(entry.name) || entry.name.startsWith('.')) continue;
         if (entry.isDirectory()) {
-          lines.push(`${prefix}📁 ${entry.name}/`);
+          lines.push(`${prefix}${entry.name}/`);
           if (recursive) lines.push(...listRecursive(path.join(dir, entry.name), prefix + '  '));
         } else {
-          lines.push(`${prefix}${getFileIcon(path.extname(entry.name))} ${entry.name}`);
+          lines.push(`${prefix}${entry.name}`);
         }
       }
       return lines;
@@ -624,12 +983,10 @@ export const listDirTool: ToolDefinition = {
 
     try {
       const lines = listRecursive(fullPath);
-      return formatToolResult(`Listed ${dirPath}`, [
-        { label: 'Mode', content: recursive ? 'recursive' : 'top-level only' },
-        { label: 'Entries', content: lines.join('\n') || '(empty directory)' },
-      ]);
+      if (lines.length === 0) return `${dirPath}: (empty)`;
+      return `${dirPath}:\n${lines.join('\n')}`;
     } catch (err: any) {
-      return `Error listing directory: ${err.message}`;
+      return `Error: ${err.message}`;
     }
   },
 };
@@ -638,22 +995,56 @@ export const listDirTool: ToolDefinition = {
 export const readCodebaseTool: ToolDefinition = {
   name: 'read_codebase',
   displayName: 'Loading codebase',
-  description: 'Read all source files in a directory recursively. Use for understanding entire project codebases.',
+  description: 'Read all source files in a directory recursively. Use mode="summary" to get a file table with line counts (way fewer tokens — then use read_file for specific files).',
   parameters: {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'Root directory (default: cwd)' },
-      extensions: { type: 'array', items: { type: 'string' }, description: 'File extensions to include.' },
+      extensions: { type: 'array', items: { type: 'string' }, description: 'File extensions to include' },
+      mode: { type: 'string', description: 'summary or content. summary = file table only (saves tokens). content = full files (default).' },
+      max_lines_per_file: { type: 'number', description: 'Max lines per file (default: unlimited). Prevents one huge file from eating budget.' },
     },
     required: [],
   },
-  getLabel: ({ path: p }) => p || '.',
-  async execute({ path: dirPath = '.', extensions }: { path?: string; extensions?: string[] }) {
+  getLabel: ({ path: p, mode }) => `${p || '.'}${mode === 'summary' ? ' (summary)' : ''}`,
+  async execute({ path: dirPath = '.', extensions, mode, max_lines_per_file }: {
+    path?: string; extensions?: string[]; mode?: string; max_lines_per_file?: number;
+  }) {
     const DEFAULT_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.go', '.java', '.c', '.cpp', '.h', '.css', '.html', '.json', '.md', '.yaml', '.yml', '.toml']);
-    const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', 'coverage', '.cache']);
+    const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', 'coverage', '.cache', '.tmp-dist']);
     const IGNORE_FILES = new Set(['.DS_Store', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
     const allowedExts = extensions ? new Set(extensions) : DEFAULT_EXTS;
     const fullRoot = resolvePath(dirPath);
+    const maxPerFile = max_lines_per_file ? Number(max_lines_per_file) : 0;
+    const summary: Array<{ path: string; lines: number; size: number }> = [];
+
+    if (mode === 'summary') {
+      // Walk and collect file metadata only
+      function walk(dir: string) {
+        let entries;
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        for (const entry of entries) {
+          const fullPath = path.join(dir, entry.name);
+          if (entry.isDirectory()) { if (!IGNORE_DIRS.has(entry.name)) walk(fullPath); }
+          else if (entry.isFile()) {
+            if (IGNORE_FILES.has(entry.name)) continue;
+            if (!allowedExts.has(path.extname(entry.name).toLowerCase())) continue;
+            try {
+              const content = fs.readFileSync(fullPath, 'utf-8');
+              const relPath = path.relative(fullRoot, fullPath).replace(/\\/g, '/');
+              summary.push({ path: relPath, lines: content.split('\n').length, size: content.length });
+            } catch { /* skip */ }
+          }
+        }
+      }
+      walk(fullRoot);
+      if (summary.length === 0) return 'summary: no source files found';
+      summary.sort((a, b) => a.path.localeCompare(b.path));
+      const table = summary.map(s => `${String(s.lines).padStart(5)}L ${s.path}`);
+      return `read_codebase summary (${summary.length} files):\n${table.join('\n')}\n\nTip: use read_file with offset/limit to peek at specific files.`;
+    }
+
+    // Content mode
     const results: string[] = [];
     let totalSize = 0;
     const MAX_SIZE = 200 * 1024;
@@ -668,16 +1059,20 @@ export const readCodebaseTool: ToolDefinition = {
       });
       for (const entry of entries) {
         if (totalSize > MAX_SIZE) break;
-        const fullPath2 = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (!IGNORE_DIRS.has(entry.name)) walk(fullPath2);
-        } else if (entry.isFile()) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) { if (!IGNORE_DIRS.has(entry.name)) walk(fullPath); }
+        else if (entry.isFile()) {
           if (IGNORE_FILES.has(entry.name)) continue;
           if (!allowedExts.has(path.extname(entry.name).toLowerCase())) continue;
           try {
-            const content = fs.readFileSync(fullPath2, 'utf-8');
-            const relPath = path.relative(fullRoot, fullPath2).replace(/\\/g, '/');
-            const snippet = `\n${'─'.repeat(60)}\n📄 ${relPath}\n${'─'.repeat(60)}\n${addLineNumbers(content)}`;
+            let content = fs.readFileSync(fullPath, 'utf-8');
+            const relPath = path.relative(fullRoot, fullPath).replace(/\\/g, '/');
+            const lines = content.split('\n');
+            if (maxPerFile > 0 && lines.length > maxPerFile) {
+              content = lines.slice(0, maxPerFile).join('\n') + `\n... [${lines.length - maxPerFile} more lines]`;
+            }
+            const ext = path.extname(relPath).slice(1) || 'text';
+            const snippet = `\n${'='.repeat(50)}\n${relPath}  (${lines.length} lines)\n${'='.repeat(50)}\n\`\`\`${ext}\n${addLineNumbers(content)}\n\`\`\``;
             results.push(snippet);
             totalSize += snippet.length;
           } catch { /* skip */ }
@@ -686,35 +1081,112 @@ export const readCodebaseTool: ToolDefinition = {
     }
 
     walk(fullRoot);
-    if (results.length === 0) return 'No source files found in that directory.';
-    return formatToolResult(`Loaded codebase from ${dirPath}`, [
-      { label: 'Extensions', content: [...allowedExts].join(', ') },
-      { label: 'Contents', content: results.join('\n') + (totalSize > MAX_SIZE ? '\n\n[...codebase truncated at 200KB limit]' : '') },
-    ]);
+    if (results.length === 0) return 'No source files found.';
+    return `read_codebase: ${dirPath}\n${results.join('\n')}${totalSize > MAX_SIZE ? '\n\n[...truncated at 200KB]' : ''}`;
   },
 };
 
-// ─── Ask User (mid-task clarification) ─────────────────────────────────────────────
+// ─── Ask User (mid-task clarification) ────────────────────────────────────────
 export const askUserTool: ToolDefinition = {
   name: 'ask_user',
   displayName: 'Asking',
-  description: 'Ask the user a clarifying question mid-task when you need more information to proceed. Use sparingly — only when genuinely ambiguous.',
+  description: 'Ask the user a question when you need more information. Use sparingly.',
   parameters: {
     type: 'object',
     properties: {
       question: { type: 'string', description: 'The question to ask the user' },
+      timeout_seconds: { type: 'number', description: 'Seconds to wait before using default (default: no timeout)' },
+      default_response: { type: 'string', description: 'Default answer if user does not respond in time' },
     },
     required: ['question'],
   },
   getLabel: ({ question }) => question,
-  async execute({ question }) {
-    // Print the question visibly
+  async execute({ question, timeout_seconds, default_response }) {
     process.stdout.write('\n' + chalk.cyan('  ? ') + chalk.white.bold(question) + '\n');
+    if (default_response) process.stdout.write(chalk.dim(`  [default: ${default_response}]\n`));
     process.stdout.write(chalk.dim('  Your answer: '));
     return new Promise<string>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
-      rl.once('line', (answer) => { rl.close(); resolve(answer.trim() || '(no answer)'); });
+      rl.once('line', (answer) => {
+        if (timer) clearTimeout(timer);
+        rl.close();
+        const trimmed = answer.trim();
+        resolve(trimmed || default_response || '(no answer)');
+      });
+      if (timeout_seconds && Number(timeout_seconds) > 0) {
+        timer = setTimeout(() => {
+          try { rl.close(); } catch { }
+          resolve(default_response || '(timed out)');
+        }, Number(timeout_seconds) * 1000);
+      }
     });
+  },
+};
+
+// ─── Git ─────────────────────────────────────────────────────────────────────
+export const gitTool: ToolDefinition = {
+  name: 'git',
+  displayName: 'Git',
+  description: 'Run common git operations with structured output. Faster and fewer tokens than execute_shell with raw git commands. Supports: status, diff, log, branch, add, commit.',
+  parameters: {
+    type: 'object',
+    properties: {
+      op: { type: 'string', description: 'Operation: status, diff, log, branch, add, commit' },
+      files: { type: 'array', items: { type: 'string' }, description: 'Files to stage (for add) or commit message (for commit)' },
+      message: { type: 'string', description: 'Commit message (for commit operation)' },
+      max_log: { type: 'number', description: 'Max log entries (default: 10)' },
+    },
+    required: ['op'],
+  },
+  requiresConfirmation: true,
+  getLabel: ({ op, files }) => `git ${op}${files?.length ? ` ${files.join(' ')}` : ''}`,
+  getRiskSummary: ({ op, message }) => {
+    const parts = [`git ${op}`];
+    if (message) parts.push(`message="${message}"`);
+    return parts.join(' | ');
+  },
+  async execute({ op, files, message, max_log = 10 }) {
+    const cwd = process.cwd();
+    const run = (args: string) => {
+      try {
+        return require('child_process').execSync(`git ${args}`, { cwd, timeout: 15000, encoding: 'utf-8', maxBuffer: 512 * 1024 }).trim();
+      } catch (e: any) {
+        return `Error: ${e.stderr?.trim() || e.message}`;
+      }
+    };
+
+    switch (op) {
+      case 'status': {
+        const out = run('status --porcelain');
+        if (!out) return 'git status: clean (no changes)';
+        const lines: string[] = out.split('\n').filter(Boolean);
+        const staged = lines.filter((l: string) => /^[MDRACU]/.test(l));
+        const unstaged = lines.filter((l: string) => /^.[MDR]/.test(l));
+        const untracked = lines.filter((l: string) => l.startsWith('??'));
+        const parts = [`git status: ${lines.length} changes`];
+        if (staged.length) parts.push(`Staged (${staged.length}):\n${staged.join('\n')}`);
+        if (unstaged.length) parts.push(`Modified (${unstaged.length}):\n${unstaged.join('\n')}`);
+        if (untracked.length) parts.push(`Untracked (${untracked.length}):\n${untracked.join('\n')}`);
+        return parts.join('\n\n');
+      }
+      case 'diff':
+        return `git diff:\n\`\`\`diff\n${run('diff --stat')}\`\`\`\n\n\`\`\`diff\n${truncateText(run('diff'), 8000)}\`\`\``;
+      case 'log':
+        return `git log (last ${max_log}):\n${run(`log --oneline -${max_log}`)}`;
+      case 'branch':
+        return `git branches:\n${run('branch -a')}`;
+      case 'add': {
+        const targets = files?.length ? files.join(' ') : '.';
+        return `git add ${targets}:\n${run(`add ${targets}`) || 'staged'}`;
+      }
+      case 'commit': {
+        if (!message) return 'Error: commit requires a message param.';
+        return `git commit:\n${run(`commit -m "${message.replace(/"/g, '\\"')}"`) || 'committed'}`;
+      }
+      default:
+        return `Unknown git operation: ${op}. Supported: status, diff, log, branch, add, commit.`;
+    }
   },
 };
 
@@ -729,4 +1201,5 @@ export const tools: ToolDefinition[] = [
   listDirTool,
   readCodebaseTool,
   askUserTool,
+  gitTool,
 ];

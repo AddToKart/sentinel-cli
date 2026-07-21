@@ -3,79 +3,69 @@ import path from 'path';
 import readline from 'readline';
 import chalk from 'chalk';
 import figures from 'figures';
-import { COLORS, THEME } from './theme.js';
+import { COLORS, Style, THEME } from './theme.js';
 import { highlightMentions } from './rendering.js';
 
+// ─── History ──────────────────────────────────────────────────────────────
+const MAX_HISTORY = 200;
 const inputHistory: string[] = [];
 let historyIdx = -1;
 let historyTempBuf = '';
 
+// ─── ANSI Helpers ─────────────────────────────────────────────────────────
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
-const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', '.cache', 'coverage']);
+function stripAnsi(text: string): string { return text.replace(ANSI_RE, ''); }
+function visibleLen(text: string): number { return stripAnsi(text).length; }
+
+// ─── Ignored dirs ────────────────────────────────────────────────────────
+const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__', '.cache', 'coverage', '.tmp-dist']);
+
 export const SLASH_COMMANDS = [
   '/help',
+  '/connect',
+  '/providers',
   '/models',
   '/tools',
   '/stats',
   '/compact',
   '/planning',
+  '/sandbox',
+  '/trust',
+  '/untrust',
   '/save',
+  '/load',
   '/init',
   '/clear',
+  '/config',
   '/exit',
   '/quit',
 ];
 
-function stripAnsi(text: string): string {
-  return text.replace(ANSI_RE, '');
-}
-
-function visibleLength(text: string): number {
-  return stripAnsi(text).length;
-}
-
-function truncateLeft(text: string, max: number): string {
-  if (max <= 0) return '';
-  if (text.length <= max) return text;
-  if (max === 1) return '…';
-  return `…${text.slice(text.length - max + 1)}`;
-}
-
-function truncateRight(text: string, max: number): string {
-  if (max <= 0) return '';
-  if (text.length <= max) return text;
-  if (max === 1) return '…';
-  return `${text.slice(0, max - 1)}…`;
-}
-
-export function getCommandSuggestions(buffer: string, commands: string[] = SLASH_COMMANDS): string[] {
+// ─── Command Suggestions ─────────────────────────────────────────────────
+export function getCommandSuggestions(buffer: string): string[] {
   const trimmed = buffer.trimStart().toLowerCase();
   if (!/^\/[^\s]*$/.test(trimmed)) return [];
-
   const directMatches = trimmed === '/'
-    ? commands.slice()
-    : commands.filter((cmd) => cmd.startsWith(trimmed));
-  const fallbackMatches = directMatches.length === 0 && trimmed.length > 1
-    ? commands.filter((cmd) => cmd.includes(trimmed.slice(1)))
+    ? SLASH_COMMANDS.slice()
+    : SLASH_COMMANDS.filter(cmd => cmd.startsWith(trimmed));
+  const fallback = directMatches.length === 0 && trimmed.length > 1
+    ? SLASH_COMMANDS.filter(cmd => cmd.includes(trimmed.slice(1)))
     : [];
-
-  return (directMatches.length > 0 ? directMatches : fallbackMatches).slice(0, 6);
+  return (directMatches.length > 0 ? directMatches : fallback).slice(0, 8);
 }
 
-export function getProjectFiles(rootDir: string = process.cwd()): string[] {
-  const results: string[] = [];
+// ─── Project Files ────────────────────────────────────────────────────────
+const fileCache: { files: string[]; ts: number } = { files: [], ts: 0 };
+const FILE_CACHE_TTL = 5_000;
 
+export function getProjectFiles(rootDir: string = process.cwd()): string[] {
+  if (fileCache.files.length > 0 && Date.now() - fileCache.ts < FILE_CACHE_TTL) return fileCache.files;
+  const results: string[] = [];
   function walk(dir: string, prefix = '') {
     let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const entry of entries) {
       if (IGNORE_DIRS.has(entry.name)) continue;
-
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
         results.push(`${rel}/`);
@@ -85,322 +75,545 @@ export function getProjectFiles(rootDir: string = process.cwd()): string[] {
       }
     }
   }
-
   walk(rootDir);
+  fileCache.files = results;
+  fileCache.ts = Date.now();
   return results;
 }
 
-export interface SmartInputFrameParams {
-  width: number;
-  buffer: string;
-  statusLines: string[] | undefined;
-  placeholder?: string;
+// ─── Input Sanitization ─────────────────────────────────────────────────
+// Strips real ANSI SGR escapes AND residual SGR fragments (e.g. "4m" from a
+// partially-consumed "\x1b[34m") that terminals like Warp can inject into
+// the keypress stream — otherwise they fuse into @mention tokens.
+function cleanUserInput(text: string): string {
+  return text
+    .replace(/\x1b\[[0-9;]*m/g, '')
+    .replace(/@\[?[0-9;]*m(?=[\w./\\-])/g, '@');
+}
+
+// ─── Input State ─────────────────────────────────────────────────────────
+interface InputState {
+  lines: string[];
+  cursorLine: number;
+  cursorCol: number;
   mentionStart: number;
+  mentionQuery: string;
   mentionFiltered: string[];
   mentionSelectedIdx: number;
   commandFiltered: string[];
   commandSelectedIdx: number;
+  selecting: boolean;
+  hasRendered: boolean;
+  inputHistory: string[];
+  historyIdx: number;
+  historyTempBuf: string;
 }
 
-export function buildSmartInputFrame(params: SmartInputFrameParams) {
-  const {
-    width,
-    buffer,
-    statusLines,
-    placeholder = THEME.dim('Type your message, @path/to/file, or /command...'),
-    mentionStart,
-    mentionFiltered,
-    mentionSelectedIdx,
-    commandFiltered,
-    commandSelectedIdx,
-  } = params;
+// ─── Frame Builder ────────────────────────────────────────────────────────
+function buildFrame(state: InputState, width: number, statusLines?: string[]): {
+  display: string[];
+  cursorLine: number;
+  cursorCol: number;
+} {
+  const { lines, cursorLine, cursorCol, mentionStart, mentionFiltered, mentionSelectedIdx, commandFiltered, commandSelectedIdx } = state;
+  const safeW = Math.max(60, width);
+  const result: string[] = [];
 
-  const safeWidth = Math.max(54, width || 80);
-  const promptPrefix = `${THEME.border('│')} ${THEME.accent(figures.pointerSmall)} `;
-  const promptWidth = Math.max(12, safeWidth - visibleLength(promptPrefix) - 3);
-  const preview = buffer ? truncateLeft(buffer, promptWidth) : '';
-  const display = buffer ? THEME.userText(highlightMentions(preview)) : placeholder;
-  const cursorColumn = visibleLength(promptPrefix) + visibleLength(preview);
-  const showCommandSuggestions = commandFiltered.length > 0;
-  const showMentionSuggestions = !showCommandSuggestions && mentionStart >= 0 && mentionFiltered.length > 0;
-  const lines: string[] = [];
+  // Status bar
+  if (statusLines && statusLines.length > 0) result.push(...statusLines);
 
-  if (statusLines && statusLines.length > 0) {
-    lines.push(...statusLines);
+  // Top border
+  result.push(Style.border(`╭${'─'.repeat(safeW - 2)}╮`));
+
+  // Input lines
+  const prefix = `${Style.border('│')} ${Style.icon('▸')} `;
+  const prefixLen = visibleLen(prefix);
+  const inputW = safeW - prefixLen - 2;
+
+  if (lines.length === 0 || (lines.length === 1 && lines[0] === '')) {
+    result.push(`${prefix}${THEME.dim('Type a message, @file, or /command…')}`);
+  } else {
+    for (let i = 0; i < lines.length; i++) {
+      const raw = lines[i] ?? '';
+      // Split long lines visually
+      if (stripAnsi(raw).length > inputW) {
+        for (let j = 0; j < raw.length; j += inputW) {
+          const chunk = raw.slice(j, j + inputW);
+          result.push(`${i === 0 ? prefix : `${Style.border('│')} ${' '.repeat(prefixLen - 2)}`}${chunk}`);
+        }
+      } else {
+        result.push(`${i === 0 ? prefix : `${Style.border('│')} ${' '.repeat(prefixLen - 2)}`}${raw}`);
+      }
+    }
   }
 
-  lines.push(THEME.border(`╭${'─'.repeat(Math.max(0, safeWidth - 2))}╮`));
-  lines.push(`${promptPrefix}${display}`);
-  lines.push(THEME.border(`╰${'─'.repeat(Math.max(0, safeWidth - 2))}╯`));
-  lines.push(THEME.dim(`  ${figures.arrowUp}/${figures.arrowDown} history  Tab autocomplete  Enter submit  Esc dismiss`));
+  // Bottom border
+  result.push(Style.border(`╰${'─'.repeat(safeW - 2)}╯`));
 
-  if (showCommandSuggestions) {
-    const suggestionWidth = Math.max(16, safeWidth - 12);
+  // Help bar
+  const helpItems = [
+    'Enter submit',
+    'S-Enter newline',
+    '↑↓ history',
+    'Tab complete',
+    'Esc dismiss',
+  ];
+  result.push(Style.dim(`  ${helpItems.map(h => `◈ ${h}`).join('  ')}`));
+
+  // Suggestions
+  const showCmds = commandFiltered.length > 0;
+  const showFiles = !showCmds && mentionStart >= 0 && mentionFiltered.length > 0;
+
+  if (showCmds) {
     for (let i = 0; i < commandFiltered.length; i++) {
-      const command = commandFiltered[i] ?? '';
-      const selected = i === commandSelectedIdx;
-      const label = truncateRight(command, suggestionWidth);
-      const line = selected
-        ? chalk.bgHex(COLORS.slate800)(`${THEME.accent(` ${figures.play} `)}${chalk.hex(COLORS.slate100)(label)}`)
-        : THEME.dim(`   ${label}`);
-      lines.push(`${THEME.dim(' ⌘ ')}${line}`);
+      const cmd = commandFiltered[i] ?? '';
+      const sel = i === commandSelectedIdx;
+      const label = sel
+        ? chalk.bgHex(COLORS.slate750)(`${Style.accent(` ${figures.play} `)}${chalk.hex(COLORS.slate100)(cmd)}`)
+        : Style.dim(`   ${cmd}`);
+      result.push(`${Style.dim(' ⌘ ')}${label}`);
     }
-  } else if (showMentionSuggestions) {
-    const suggestionWidth = Math.max(16, safeWidth - 14);
+  } else if (showFiles) {
     for (let i = 0; i < mentionFiltered.length; i++) {
       const file = mentionFiltered[i] ?? '';
-      const selected = i === mentionSelectedIdx;
-      const icon = file.endsWith('/') ? chalk.yellow('dir') : THEME.dim('file');
-      const label = truncateRight(file, suggestionWidth);
-      const line = selected
-        ? chalk.bgHex(COLORS.slate800)(`${THEME.accent(` ${figures.play} `)}${chalk.hex(COLORS.slate100)(label)}`)
-        : THEME.dim(`   ${label}`);
-      lines.push(` ${icon} ${line}`);
+      const sel = i === mentionSelectedIdx;
+      const icon = file.endsWith('/') ? chalk.yellow('📁') : Style.dim('📄');
+      const label = sel
+        ? chalk.bgHex(COLORS.slate750)(`${Style.accent(` ${figures.play} `)}${chalk.hex(COLORS.slate100)(file)}`)
+        : Style.dim(`   ${file}`);
+      result.push(` ${icon} ${label}`);
     }
   }
 
-  const inputRowIndex = (statusLines?.length ?? 0) + 1;
-  const rowsBelowInput = lines.length - 1 - inputRowIndex;
-  return { lines, cursorColumn, inputRowIndex, rowsBelowInput };
+  // Calculate cursor position
+  let absCursorLine = cursorLine;
+  let absCursorCol = cursorCol + prefixLen; // prefix "│ ▸ " is prefixLen visible chars
+  const visiblePrefix = stripAnsi(prefix);
+  // Account for line wrapping
+  let lineWraps = 0;
+  for (let i = 0; i < cursorLine; i++) {
+    const raw = lines[i] ?? '';
+    lineWraps += Math.max(0, Math.floor(stripAnsi(raw).length / inputW));
+  }
+  absCursorLine += lineWraps + (statusLines?.length ?? 0) + 1; // +1 for top border
+
+  return { display: result, cursorLine: absCursorLine, cursorCol: absCursorCol };
 }
 
+// ─── Main Input Function ─────────────────────────────────────────────────
 export async function smartInput(statusLines?: string[]): Promise<string> {
   return new Promise<string>((resolve) => {
-    let buf = '';
-    let mentionStart = -1;
-    let mentionQuery = '';
-    let mentionSelectedIdx = 0;
-    let mentionFiltered: string[] = [];
-    let commandSelectedIdx = 0;
-    let commandFiltered: string[] = [];
-    let lastTopOffset = 0;
-    let hasRendered = false;
-
     const allFiles = getProjectFiles();
-    const placeholder = THEME.dim('Type your message, @path/to/file, or /command...');
+    let hasRendered = false;
+    let lastCursorLine = 0;
 
-    readline.emitKeypressEvents(process.stdin);
+    const state: InputState = {
+      lines: [''],
+      cursorLine: 0,
+      cursorCol: 0,
+      mentionStart: -1,
+      mentionQuery: '',
+      mentionFiltered: [],
+      mentionSelectedIdx: 0,
+      commandFiltered: [],
+      commandSelectedIdx: 0,
+      selecting: false,
+      hasRendered: false,
+      inputHistory: [...inputHistory],
+      historyIdx: -1,
+      historyTempBuf: '',
+    };
 
-    function clearRender() {
-      if (hasRendered && lastTopOffset > 0) {
-        process.stdout.write(`\x1b[${lastTopOffset}A`);
-      }
-      process.stdout.write('\r\x1b[J');
-      hasRendered = false;
-      lastTopOffset = 0;
+    function currentLine(): string { return state.lines[state.cursorLine] ?? ''; }
+    function setLine(v: string) { state.lines[state.cursorLine] = v; }
+    function cursorInMention(): boolean {
+      if (state.mentionStart < 0) return false;
+      return state.cursorLine === 0 && state.cursorCol >= state.mentionStart;
     }
 
     function filterFiles() {
-      const query = mentionQuery.toLowerCase();
-      mentionFiltered = allFiles
-        .filter((file) => !query || file.toLowerCase().includes(query))
-        .slice(0, 6);
-      mentionSelectedIdx = Math.min(mentionSelectedIdx, Math.max(0, mentionFiltered.length - 1));
+      const q = state.mentionQuery.toLowerCase();
+      state.mentionFiltered = allFiles
+        .filter(f => !q || f.toLowerCase().includes(q))
+        .slice(0, 8);
+      state.mentionSelectedIdx = Math.min(state.mentionSelectedIdx, Math.max(0, state.mentionFiltered.length - 1));
     }
 
     function updateCommandSuggestions() {
-      commandFiltered = getCommandSuggestions(buf, SLASH_COMMANDS);
-      commandSelectedIdx = Math.min(commandSelectedIdx, Math.max(0, commandFiltered.length - 1));
+      const buf = state.lines.join('\n');
+      state.commandFiltered = getCommandSuggestions(buf);
+      state.commandSelectedIdx = Math.min(state.commandSelectedIdx, Math.max(0, state.commandFiltered.length - 1));
     }
 
     function applyCommandSuggestion(): boolean {
-      const selected = commandFiltered[commandSelectedIdx];
-      if (!selected) return false;
-
-      const trimmed = buf.trimStart();
-      const leading = buf.slice(0, buf.length - trimmed.length);
-      const nextValue = `${leading}${selected}`;
-      if (nextValue === buf) return false;
-
-      buf = nextValue;
-      commandFiltered = [];
-      commandSelectedIdx = 0;
+      const sel = state.commandFiltered[state.commandSelectedIdx];
+      if (!sel) return false;
+      state.lines = [sel + ' '];
+      state.cursorLine = 0;
+      state.cursorCol = sel.length + 1;
+      state.commandFiltered = [];
+      state.commandSelectedIdx = 0;
       return true;
     }
 
     function applyMentionSuggestion(): boolean {
-      const selected = mentionFiltered[mentionSelectedIdx];
-      if (!selected || mentionStart < 0) return false;
-
-      buf = `${buf.slice(0, mentionStart)}@${selected}${selected.endsWith('/') ? '' : ' '}`;
-      mentionStart = -1;
-      mentionQuery = '';
-      mentionFiltered = [];
-      mentionSelectedIdx = 0;
+      const sel = state.mentionFiltered[state.mentionSelectedIdx];
+      if (!sel || state.mentionStart < 0) return false;
+      const line = state.lines[0] ?? '';
+      const after = sel.endsWith('/') ? '' : ' ';
+      state.lines[0] = `${line.slice(0, state.mentionStart)}@${sel}${after}`;
+      state.cursorCol = state.lines[0].length;
+      state.mentionStart = -1;
+      state.mentionQuery = '';
+      state.mentionFiltered = [];
+      state.mentionSelectedIdx = 0;
       return true;
     }
 
+    function getFullBuffer(): string {
+      return state.lines.join('\n');
+    }
+
+    /**
+     * Calculate how many terminal lines the display array occupies.
+     * Each display entry is 1 line. We add 1 for the final cursor row.
+     */
+    function displayHeight(display: string[]): number {
+      return display.length + 1; // +1 for cursor row below display
+    }
+
+    // Track the previous frame's cursor offset from frame start for clear/rewrite
+    let prevCursorOffset = 0;
+    let hasFrame = false;
+
     function render() {
       updateCommandSuggestions();
-      const { lines, cursorColumn, inputRowIndex, rowsBelowInput } = buildSmartInputFrame({
-        width: process.stdout.columns || 80,
-        buffer: buf,
-        statusLines,
-        placeholder,
-        mentionStart,
-        mentionFiltered,
-        mentionSelectedIdx,
-        commandFiltered,
-        commandSelectedIdx,
-      });
+      const w = process.stdout.columns || 80;
+      const { display, cursorLine: absCursorLine, cursorCol: absCursorCol } = buildFrame(state, w, statusLines);
 
       process.stdout.write('\x1b[?25l');
-      clearRender();
-      process.stdout.write(lines.join('\n\r'));
 
-      if (rowsBelowInput > 0) {
-        process.stdout.write(`\x1b[${rowsBelowInput}A`);
+      if (hasFrame) {
+        // Move up from current cursor position to the start of the previous frame,
+        // then clear from there to end of screen.
+        process.stdout.write(`\x1b[${prevCursorOffset}A`);
+        process.stdout.write('\r');
+        process.stdout.write('\x1b[J');
       }
 
+      // Save the cursor offset for next render's clear
+      prevCursorOffset = absCursorLine;
+      hasFrame = true;
+
+      // Write the full frame
+      for (let i = 0; i < display.length; i++) {
+        if (i > 0) process.stdout.write('\n');
+        process.stdout.write(display[i]!);
+      }
+
+      // Position cursor inside the frame at the input line.
+      // After writing the frame, cursor is at end of last display line.
+      // First move up to the input line row.
+      const linesUp = (display.length - 1) - absCursorLine;
+      if (linesUp > 0) {
+        process.stdout.write(`\x1b[${linesUp}A`);
+      }
+      // Cursor kept the column from the end of the last line — reset to column 1.
       process.stdout.write('\r');
-      if (cursorColumn > 0) {
-        process.stdout.write(`\x1b[${cursorColumn}C`);
+      // Now move right to the text column: prefix "│ ▸ " is prefixLen visible chars
+      if (absCursorCol > 0) {
+        process.stdout.write(`\x1b[${absCursorCol}C`);
       }
       process.stdout.write('\x1b[?25h');
-
-      hasRendered = true;
-      lastTopOffset = inputRowIndex;
     }
 
     function done(value: string) {
       process.stdout.write('\x1b[?25h');
-      clearRender();
+      if (hasFrame) {
+        // Clear the ENTIRE frame (status bar + input area) so nothing
+        // gets left behind in the conversation history.
+        process.stdout.write(`\x1b[${prevCursorOffset}A`);
+        process.stdout.write('\r');
+        process.stdout.write('\x1b[J');
+        hasFrame = false;
+      }
       process.stdin.removeListener('keypress', keypressHandler);
 
-      if (value.trim()) {
-        const width = Math.max(54, process.stdout.columns || 80);
-        const echoed = truncateRight(value, Math.max(12, width - 12));
-        process.stdout.write(
-          `${THEME.icon('◆ ')}${THEME.header('You')}${THEME.dim(' › ')}${THEME.userText(highlightMentions(echoed))}\n`
-        );
-        process.stdout.write(`${THEME.border('─'.repeat(width))}\n`);
-      }
+      // Strip any ANSI residue the terminal may have injected into the buffer
+      value = cleanUserInput(value);
 
+      if (value.trim()) {
+        const w = Math.max(54, process.stdout.columns || 80);
+        const preview = value.length > 100 ? value.slice(0, 100) + '…' : value;
+        const oneLine = preview.replace(/\n/g, '↵ ');
+        process.stdout.write(
+          `${Style.icon('◆ ')}${Style.header('You')}${Style.dim(' › ')}${Style.userText(highlightMentions(oneLine))}\n`
+        );
+        process.stdout.write(`${Style.border('─'.repeat(w))}\n`);
+      }
       resolve(value);
     }
 
+    // ─── Key Handling ─────────────────────────────────────────────────
     const keypressHandler = (_str: string, key: any) => {
       if (!key) return;
 
+      // Ctrl+C
       if (key.ctrl && key.name === 'c') {
         done('');
         process.exit(0);
         return;
       }
 
+      // Ctrl+D - exit if buffer is empty
+      if (key.ctrl && key.name === 'd') {
+        if (!getFullBuffer().trim()) {
+          done('');
+          process.exit(0);
+        }
+        return;
+      }
+
+      // Enter
       if (key.name === 'return' || key.name === 'enter') {
-        if (commandFiltered.length > 0 && applyCommandSuggestion()) {
+        // Shift+Enter = newline
+        if (key.shift) {
+          state.lines.splice(state.cursorLine + 1, 0, '');
+          state.cursorLine += 1;
+          state.cursorCol = 0;
+          state.mentionStart = -1;
           render();
           return;
         }
 
-        if (mentionStart >= 0 && mentionFiltered.length > 0 && applyMentionSuggestion()) {
+        // Tab complete on enter if suggestions active
+        if (state.commandFiltered.length > 0 && applyCommandSuggestion()) {
+          render();
+          return;
+        }
+        if (state.mentionStart >= 0 && state.mentionFiltered.length > 0 && applyMentionSuggestion()) {
           render();
           return;
         }
 
-        if (buf.trim() && buf !== inputHistory[inputHistory.length - 1]) {
-          inputHistory.push(buf);
+        const full = getFullBuffer();
+        if (full.trim() && full !== inputHistory[inputHistory.length - 1]) {
+          inputHistory.push(full);
+          if (inputHistory.length > MAX_HISTORY) inputHistory.splice(0, inputHistory.length - MAX_HISTORY);
         }
-
-        historyIdx = -1;
-        historyTempBuf = '';
-        done(buf);
+        state.historyIdx = -1;
+        state.historyTempBuf = '';
+        done(full);
         return;
       }
 
+      // Tab
       if (key.name === 'tab') {
-        if (commandFiltered.length > 0 && applyCommandSuggestion()) {
-          render();
-          return;
-        }
-
-        if (mentionStart >= 0 && mentionFiltered.length > 0 && applyMentionSuggestion()) {
-          render();
-        }
+        if (state.commandFiltered.length > 0 && applyCommandSuggestion()) { render(); return; }
+        if (state.mentionStart >= 0 && state.mentionFiltered.length > 0 && applyMentionSuggestion()) { render(); return; }
         return;
       }
 
+      // Escape
       if (key.name === 'escape') {
-        mentionStart = -1;
-        mentionQuery = '';
-        mentionFiltered = [];
-        mentionSelectedIdx = 0;
-        commandFiltered = [];
-        commandSelectedIdx = 0;
+        state.mentionStart = -1;
+        state.mentionQuery = '';
+        state.mentionFiltered = [];
+        state.mentionSelectedIdx = 0;
+        state.commandFiltered = [];
+        state.commandSelectedIdx = 0;
         render();
         return;
       }
 
+      // Up
       if (key.name === 'up') {
-        if (commandFiltered.length > 0) {
-          commandSelectedIdx = commandSelectedIdx > 0 ? commandSelectedIdx - 1 : commandFiltered.length - 1;
-        } else if (mentionStart >= 0 && mentionFiltered.length > 0) {
-          mentionSelectedIdx = mentionSelectedIdx > 0 ? mentionSelectedIdx - 1 : mentionFiltered.length - 1;
-        } else if (inputHistory.length > 0) {
-          if (historyIdx === -1) {
-            historyTempBuf = buf;
-            historyIdx = inputHistory.length - 1;
-          } else if (historyIdx > 0) {
-            historyIdx -= 1;
+        if (state.commandFiltered.length > 0) {
+          state.commandSelectedIdx = state.commandSelectedIdx > 0 ? state.commandSelectedIdx - 1 : state.commandFiltered.length - 1;
+        } else if (state.mentionStart >= 0 && state.mentionFiltered.length > 0) {
+          state.mentionSelectedIdx = state.mentionSelectedIdx > 0 ? state.mentionSelectedIdx - 1 : state.mentionFiltered.length - 1;
+        } else if (state.cursorLine > 0) {
+          // Move cursor up within multi-line
+          state.cursorLine -= 1;
+          const aboveLen = stripAnsi(state.lines[state.cursorLine] ?? '').length;
+          state.cursorCol = Math.min(state.cursorCol, aboveLen);
+        } else if (state.inputHistory.length > 0) {
+          // History navigation
+          if (state.historyIdx === -1) {
+            state.historyTempBuf = getFullBuffer();
+            state.historyIdx = state.inputHistory.length - 1;
+          } else if (state.historyIdx > 0) {
+            state.historyIdx -= 1;
           }
-          buf = inputHistory[historyIdx] ?? buf;
+          const hist = state.inputHistory[state.historyIdx];
+          if (hist !== undefined) {
+            state.lines = hist.split('\n');
+            state.cursorLine = state.lines.length - 1;
+            state.cursorCol = stripAnsi(state.lines[state.cursorLine] ?? '').length;
+          }
         }
         render();
         return;
       }
 
+      // Down
       if (key.name === 'down') {
-        if (commandFiltered.length > 0) {
-          commandSelectedIdx = commandSelectedIdx < commandFiltered.length - 1 ? commandSelectedIdx + 1 : 0;
-        } else if (mentionStart >= 0 && mentionFiltered.length > 0) {
-          mentionSelectedIdx = mentionSelectedIdx < mentionFiltered.length - 1 ? mentionSelectedIdx + 1 : 0;
-        } else if (historyIdx !== -1) {
-          historyIdx += 1;
-          if (historyIdx >= inputHistory.length) {
-            historyIdx = -1;
-            buf = historyTempBuf;
+        if (state.commandFiltered.length > 0) {
+          state.commandSelectedIdx = state.commandSelectedIdx < state.commandFiltered.length - 1 ? state.commandSelectedIdx + 1 : 0;
+        } else if (state.mentionStart >= 0 && state.mentionFiltered.length > 0) {
+          state.mentionSelectedIdx = state.mentionSelectedIdx < state.mentionFiltered.length - 1 ? state.mentionSelectedIdx + 1 : 0;
+        } else if (state.cursorLine < state.lines.length - 1) {
+          state.cursorLine += 1;
+          const belowLen = stripAnsi(state.lines[state.cursorLine] ?? '').length;
+          state.cursorCol = Math.min(state.cursorCol, belowLen);
+        } else if (state.historyIdx !== -1) {
+          state.historyIdx += 1;
+          if (state.historyIdx >= state.inputHistory.length) {
+            state.historyIdx = -1;
+            state.lines = [state.historyTempBuf];
+            state.cursorLine = 0;
+            state.cursorCol = state.lines[0]?.length ?? 0;
           } else {
-            buf = inputHistory[historyIdx] ?? buf;
+            const hist = state.inputHistory[state.historyIdx];
+            if (hist !== undefined) {
+              state.lines = hist.split('\n');
+              state.cursorLine = state.lines.length - 1;
+              state.cursorCol = stripAnsi(state.lines[state.cursorLine] ?? '').length;
+            }
           }
         }
         render();
         return;
       }
 
+      // Left
+      if (key.name === 'left') {
+        if (key.ctrl) {
+          // Word left
+          const line = currentLine();
+          let pos = state.cursorCol - 1;
+          while (pos > 0 && line[pos] === ' ') pos--;
+          while (pos > 0 && line[pos - 1] !== ' ') pos--;
+          state.cursorCol = pos;
+        } else if (state.cursorCol > 0) {
+          state.cursorCol -= 1;
+        } else if (state.cursorLine > 0) {
+          state.cursorLine -= 1;
+          state.cursorCol = stripAnsi(state.lines[state.cursorLine] ?? '').length;
+        }
+        // Cursor moved at/before the @ — exit mention state
+        if (state.mentionStart >= 0 && state.cursorCol <= state.mentionStart) {
+          state.mentionStart = -1;
+          state.mentionQuery = '';
+          state.mentionFiltered = [];
+        }
+        render();
+        return;
+      }
+
+      // Right
+      if (key.name === 'right') {
+        const lineLen = stripAnsi(currentLine()).length;
+        if (key.ctrl) {
+          // Word right
+          const line = currentLine();
+          let pos = state.cursorCol;
+          while (pos < line.length && line[pos] === ' ') pos++;
+          while (pos < line.length && line[pos] !== ' ') pos++;
+          state.cursorCol = pos;
+        } else if (state.cursorCol < lineLen) {
+          state.cursorCol += 1;
+        } else if (state.cursorLine < state.lines.length - 1) {
+          state.cursorLine += 1;
+          state.cursorCol = 0;
+        }
+        render();
+        return;
+      }
+
+      // Home
+      if (key.name === 'home') {
+        state.cursorCol = 0;
+        render();
+        return;
+      }
+
+      // End
+      if (key.name === 'end') {
+        state.cursorCol = stripAnsi(currentLine()).length;
+        render();
+        return;
+      }
+
+      // Delete (fn+backspace or delete key)
+      if (key.name === 'delete') {
+        const line = currentLine();
+        if (state.cursorCol < line.length) {
+          setLine(line.slice(0, state.cursorCol) + line.slice(state.cursorCol + 1));
+        } else if (state.cursorLine < state.lines.length - 1) {
+          // Join with next line
+          const next = state.lines[state.cursorLine + 1] ?? '';
+          setLine(line + next);
+          state.lines.splice(state.cursorLine + 1, 1);
+        }
+        render();
+        return;
+      }
+
+      // Backspace
       if (key.name === 'backspace') {
-        if (buf.length === 0) return;
-
-        buf = buf.slice(0, -1);
-        if (mentionStart >= 0) {
-          if (buf.length <= mentionStart || buf[mentionStart] !== '@') {
-            mentionStart = -1;
-            mentionQuery = '';
-            mentionFiltered = [];
-          } else {
-            mentionQuery = buf.slice(mentionStart + 1);
-            filterFiles();
+        if (state.cursorCol > 0) {
+          const line = currentLine();
+          const before = state.cursorCol - 1;
+          setLine(line.slice(0, before) + line.slice(state.cursorCol));
+          state.cursorCol = before;
+          // Update mention tracking
+          if (state.mentionStart >= 0) {
+            // Cursor at or before the @ position means the @ itself was
+            // deleted (or the cursor backed past it) — exit mention state.
+            if (state.cursorCol <= state.mentionStart) {
+              state.mentionStart = -1;
+              state.mentionQuery = '';
+              state.mentionFiltered = [];
+            } else {
+              state.mentionQuery = (state.lines[0] ?? '').slice(state.mentionStart + 1, state.cursorCol);
+              filterFiles();
+            }
           }
+        } else if (state.cursorLine > 0) {
+          // Join with previous line
+          const prevLine = state.lines[state.cursorLine - 1] ?? '';
+          const curLine = currentLine();
+          const prevLen = stripAnsi(prevLine).length;
+          state.lines[state.cursorLine - 1] = prevLine + curLine;
+          state.lines.splice(state.cursorLine, 1);
+          state.cursorLine -= 1;
+          state.cursorCol = prevLen;
         }
         render();
         return;
       }
 
+      // Insert character
       const ch: string = _str ?? '';
-      if (!ch || ch.length !== 1 || key.ctrl || key.meta) return;
+      if (!ch || ch.length !== 1 || key.ctrl || key.meta || key.alt) return;
 
-      buf += ch;
-      if (ch === '@') {
-        mentionStart = buf.length - 1;
-        mentionQuery = '';
+      const line = currentLine();
+      setLine(line.slice(0, state.cursorCol) + ch + line.slice(state.cursorCol));
+      state.cursorCol += 1;
+
+      // Track @mentions
+      if (ch === '@' && state.cursorLine === 0) {
+        state.mentionStart = state.cursorCol - 1;
+        state.mentionQuery = '';
         filterFiles();
-      } else if (mentionStart >= 0) {
+      } else if (state.mentionStart >= 0 && state.cursorLine === 0) {
         if (ch === ' ') {
-          mentionStart = -1;
-          mentionQuery = '';
-          mentionFiltered = [];
+          state.mentionStart = -1;
+          state.mentionQuery = '';
+          state.mentionFiltered = [];
         } else {
-          mentionQuery = buf.slice(mentionStart + 1);
+          state.mentionQuery = (state.lines[0] ?? '').slice(state.mentionStart + 1, state.cursorCol);
           filterFiles();
         }
       }

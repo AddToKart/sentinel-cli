@@ -1,8 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import chalk from 'chalk';
-import { COLORS, THEME } from '../ui/theme.js';
+import { Style } from '../ui/theme.js';
 import { SYSTEM_PROMPT } from './system-prompt.js';
+import { buildGitContextBlock } from './git-context.js';
 
 const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
 const RESIDUAL_SGR_RE = /\[[0-9;]*m/g;
@@ -49,7 +49,6 @@ function extractDirectFileReferences(baseFilePath: string, content: string): str
     /\bimport\s+(?:[^'"]+?\s+from\s+)?["']([^"']+)["']/gi,
     /\brequire\(\s*["']([^"']+)["']\s*\)/gi,
   ];
-
   for (const pattern of patterns) {
     let match;
     while ((match = pattern.exec(content)) !== null) {
@@ -57,25 +56,113 @@ function extractDirectFileReferences(baseFilePath: string, content: string): str
       if (candidate) refs.add(candidate);
     }
   }
-
   return [...refs];
 }
+
+// ─── SENTINEL.md Memory System ──────────────────────────────────────────
+// SENTINEL.md serves as the project's memory and instructions file.
+// It can contain:
+//   - Project overview and conventions
+//   - Coding style rules
+//   - Architecture decisions
+//   - Recurring patterns the agent should follow
+//   - Any notes the user wants the agent to remember across sessions
+
+// Hard budget: SENTINEL.md is injected into every prompt. Cap it so a
+// bloated memory file can never eat the model's context window.
+const MAX_PROJECT_CONTEXT_CHARS = 6000;
 
 export function readProjectContext(): string {
   const sentinelMdPath = path.join(process.cwd(), 'SENTINEL.md');
   if (!fs.existsSync(sentinelMdPath)) return '';
   try {
-    return fs.readFileSync(sentinelMdPath, 'utf-8');
+    let content = fs.readFileSync(sentinelMdPath, 'utf-8');
+    const stats = fs.statSync(sentinelMdPath);
+    const fileSize = formatSize(stats.size);
+    const lines = content.split('\n').length;
+
+    let truncatedNote = '';
+    if (content.length > MAX_PROJECT_CONTEXT_CHARS) {
+      content = content.slice(0, MAX_CONTEXT_CHARS_SAFE(content));
+      truncatedNote = ` (truncated to ${MAX_PROJECT_CONTEXT_CHARS} chars for context budget)`;
+    }
+
+    process.stdout.write(Style.dim(` 🧠 Loaded SENTINEL.md — project memory (${lines} lines, ${fileSize})${truncatedNote}\n`));
+
+    // Build the context block with metadata
+    return [
+      '═══ PROJECT MEMORY (SENTINEL.md) ═══',
+      'The content below is the user\'s persistent project memory and instructions.',
+      'It defines conventions, architecture decisions, and rules to follow.',
+      'Treat this as authoritative for this project.',
+      '',
+      content,
+      '',
+      '═══ END PROJECT MEMORY ═══',
+    ].join('\n');
   } catch {
     return '';
   }
 }
 
-export function composeSystemPrompt(projectContext: string, contextHeader: string): string {
-  return projectContext
-    ? `${SYSTEM_PROMPT}\n\n${contextHeader}\n${projectContext}`
-    : SYSTEM_PROMPT;
+// Cut at a newline boundary so we never slice a line in half
+function MAX_CONTEXT_CHARS_SAFE(content: string): number {
+  const cut = content.lastIndexOf('\n', MAX_PROJECT_CONTEXT_CHARS);
+  return cut > MAX_PROJECT_CONTEXT_CHARS * 0.8 ? cut : MAX_PROJECT_CONTEXT_CHARS;
 }
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Generates a default SENTINEL.md template with common sections.
+ */
+export function generateSentinelTemplate(): string {
+  return `# Sentinel Project Memory
+
+This file serves as persistent memory for the Sentinel CLI agent.
+It defines project conventions, architecture, and rules the agent should follow.
+
+## Project
+- **Name**:
+- **Stack**:
+- **Description**:
+
+## Coding Conventions
+- Framework/Libraries:
+- Testing approach:
+- Code style preferences:
+- Naming conventions:
+
+## Architecture
+- Key directories and their purposes:
+- Data flow patterns:
+- State management approach:
+
+## Recurring Tasks
+- Common commands (build, test, lint):
+- Deployment process:
+- Database migrations:
+
+## Notes for the Agent
+- Any gotchas or important context the agent should always remember.
+- Preferred approaches for common modifications.
+`;
+}
+
+export function composeSystemPrompt(projectContext: string, contextHeader: string): string {
+  const gitBlock = buildGitContextBlock();
+  const parts = [SYSTEM_PROMPT];
+  if (projectContext) parts.push(`\n${contextHeader}\n${projectContext}`);
+  if (gitBlock) parts.push(`\n═══ GIT WORKSPACE ═══\n${gitBlock.replace('Git workspace snapshot (auto-detected):', '').trim()}`);
+
+  return parts.join('\n\n');
+}
+
+// ─── Context Injection ──────────────────────────────────────────────────
 
 export interface MentionContextResult {
   content: string;
@@ -105,7 +192,7 @@ export async function injectMentionedContextWithMetadata(input: string): Promise
         const relatedContent = fs.readFileSync(refPath, 'utf-8');
         const relativePath = path.relative(process.cwd(), refPath).replace(/\\/g, '/');
         const ext = path.extname(refPath).slice(1) || 'text';
-        process.stdout.write(chalk.dim(` 🔗 Linked context: `) + THEME.accent(relativePath) + chalk.dim(` (${relatedContent.split('\n').length} lines)\n`));
+        process.stdout.write(Style.dim(` 🔗 Linked context: ${relativePath} (${relatedContent.split('\n').length} lines)\n`));
         injections.push(`--- Related File: ${relativePath} ---\n\`\`\`${ext}\n${relatedContent}\n\`\`\`\n---`);
         loadedFiles.push(refPath);
       } catch { /* skip unreadable */ }
@@ -123,14 +210,14 @@ export async function injectMentionedContextWithMetadata(input: string): Promise
       injected.add(loadKey);
       const { readCodebaseTool } = await import('../../tools/index.js');
       const contents = await readCodebaseTool.execute({ path: mentionedPath });
-      process.stdout.write(chalk.dim(` 📁 Loading codebase: ${mentionedPath}\n`));
+      process.stdout.write(Style.dim(` 📁 Loading codebase: ${mentionedPath}\n`));
       injections.push(`--- Context from @${mentionedPath} (full codebase) ---\n${contents}\n---`);
     } else if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
       injected.add(loadKey);
       try {
         const content = fs.readFileSync(fullPath, 'utf-8');
         const ext = path.extname(mentionedPath).slice(1) || 'text';
-        process.stdout.write(chalk.dim(` 📄 Auto-loaded: `) + THEME.accent(mentionedPath) + chalk.dim(` (${content.split('\n').length} lines)\n`));
+        process.stdout.write(Style.dim(` 📄 Auto-loaded: ${mentionedPath} (${content.split('\n').length} lines)\n`));
         injections.push(`--- File: ${mentionedPath} ---\n\`\`\`${ext}\n${content}\n\`\`\`\n---`);
         loadedFiles.push(fullPath);
         anchorFiles.push(fullPath);
@@ -151,7 +238,7 @@ export async function injectMentionedContextWithMetadata(input: string): Promise
       try {
         const content = fs.readFileSync(fullPath, 'utf-8');
         const ext = path.extname(mentionedPath).slice(1) || 'text';
-        process.stdout.write(chalk.dim(` 📄 Auto-loaded: `) + THEME.accent(mentionedPath) + chalk.dim(` (${content.split('\n').length} lines)\n`));
+        process.stdout.write(Style.dim(` 📄 Auto-loaded: ${mentionedPath} (${content.split('\n').length} lines)\n`));
         injections.push(`--- File: ${mentionedPath} ---\n\`\`\`${ext}\n${content}\n\`\`\`\n---`);
         loadedFiles.push(fullPath);
         anchorFiles.push(fullPath);

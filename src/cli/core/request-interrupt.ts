@@ -1,5 +1,6 @@
 import chalk from 'chalk';
 import readline from 'readline';
+import { Style } from '../ui/theme.js';
 
 type CancelToken = { kind: 'cancel' };
 type ValueToken<T> = { kind: 'value'; value: T };
@@ -25,13 +26,12 @@ export function createTurnInterruptController(): TurnInterruptController {
     escCount += 1;
     if (escCount === 1) {
       interrupted = true;
-      process.stdout.write(chalk.yellow('\n  ⚠ Interrupt requested. Press Esc again to cancel this request.\n'));
+      process.stdout.write(Style.warning(`\n  ⚠ Interrupt requested. Press Esc again to cancel.\n`));
       return;
     }
-
     hardCancelled = true;
     abortController.abort();
-    process.stdout.write(chalk.red('\n  ✖ Request cancelled.\n'));
+    process.stdout.write(Style.error(`\n  ✖ Request cancelled.\n`));
     for (const cancel of cancelWaiters) cancel();
     cancelWaiters.clear();
   };
@@ -57,25 +57,18 @@ export function createTurnInterruptController(): TurnInterruptController {
       });
 
       const winner = await Promise.race<ValueToken<T> | ErrorToken | CancelToken>([
-        taskPromise,
-        cancelPromise,
+        taskPromise, cancelPromise,
       ]);
       cancelWaiters.delete(cancel);
 
-      if (winner.kind === 'cancel') {
-        return { cancelled: true };
-      }
-      if (winner.kind === 'error') {
-        throw winner.error;
-      }
+      if (winner.kind === 'cancel') return { cancelled: true };
+      if (winner.kind === 'error') throw winner.error;
       return { cancelled: false, value: winner.value };
     },
     stop() {
       process.stdin.removeListener('keypress', keypressHandler);
       cancelWaiters.clear();
-      if (!abortController.signal.aborted && hardCancelled) {
-        abortController.abort();
-      }
+      if (!abortController.signal.aborted && hardCancelled) abortController.abort();
     }
   };
 }

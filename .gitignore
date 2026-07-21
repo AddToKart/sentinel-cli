@@ -28,6 +28,12 @@ calculator.html
 test/index.html
 GEMINI.md
 
+# Build artifacts (outdated)
+.tmp-dist/
+
+# Scratch/test files
+hello-world.html
+
 # IDE / Editor
 .vscode/
 .idea/
