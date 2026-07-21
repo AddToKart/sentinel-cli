@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { ProviderResponse } from '../../providers/types.js';
+import { recall, extractMemoryFromToolResult, remember, hasMemory } from './persistent-memory.js';
 
 type MemoryKind = 'tool' | 'summary';
 
@@ -112,6 +113,19 @@ export class HarnessMemory {
     this.items.push({ kind, source, content: trimmed, keywords: extractKeywords(`${source} ${trimmed}`), ts: Date.now() });
     if (this.items.length > this.maxItems) {
       this.items = this.items.slice(this.items.length - this.maxItems);
+    }
+
+    // Auto-extract to persistent memory on significant tool results
+    if (kind === 'tool') {
+      try {
+        const [toolName, ...pathParts] = source.split(' ');
+        const toolArgs: any = {};
+        if (toolName && pathParts.length > 0) toolArgs.path = pathParts.join(' ');
+        const extracted = toolName ? extractMemoryFromToolResult(toolName, toolArgs, content) : null;
+        if (extracted && !hasMemory(extracted.content)) {
+          remember(extracted.type, extracted.content, `auto:${source}`, extracted.keywords);
+        }
+      } catch { /* extraction is best-effort */ }
     }
   }
 }
@@ -365,8 +379,23 @@ export function buildPolicyHints(userInput: string): string[] {
 
 export function buildMemoryContext(userInput: string, memory: HarnessMemory): string {
   const hits = memory.retrieve(userInput, 3);
-  if (hits.length === 0) return '';
-  return hits.map((h, i) => `- [${i + 1}] ${h.kind}:${h.source}\n${h.content}`).join('\n\n');
+  const parts: string[] = [];
+  if (hits.length > 0) {
+    parts.push(hits.map((h, i) => `- [${i + 1}] ${h.kind}:${h.source}\n${h.content}`).join('\n\n'));
+  }
+
+  // Also recall persistent (cross-session) memories
+  try {
+    const persistentHits = recall(userInput, 3);
+    if (persistentHits.length > 0) {
+      parts.push('Persistent project memories:');
+      for (const m of persistentHits) {
+        parts.push(`- [${m.type}] ${m.content}`);
+      }
+    }
+  } catch { /* skip */ }
+
+  return parts.join('\n\n');
 }
 
 export function injectHarnessContext(userInput: string, memoryContext: string, policyHints: string[]): string {

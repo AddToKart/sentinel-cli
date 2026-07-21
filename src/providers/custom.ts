@@ -82,6 +82,10 @@ export class CustomProvider implements AIProvider {
   }
 
   private wrapError(error: any): never {
+    if (axios.isCancel(error)) {
+      // Request was aborted via signal — re-throw so upstream can handle as cancelled
+      throw error;
+    }
     if (axios.isAxiosError(error) && error.response) {
       const data = error.response.data as any;
       const msg = data?.error?.message || JSON.stringify(data).slice(0, 200);
@@ -97,10 +101,12 @@ export class CustomProvider implements AIProvider {
   async sendMessage(messages: Message[], tools?: any[], options: ProviderRequestOptions = {}): Promise<ProviderResponse> {
     return withProviderRetries(async () => {
       try {
+        const axiosOpts: any = { headers: this.getHeaders(), timeout: 60_000 };
+        if (options.signal) axiosOpts.signal = options.signal;
         const response = await axios.post(
           this.getEndpoint(),
           this.buildPayload(messages, tools, false),
-          { headers: this.getHeaders(), timeout: 60_000 }
+          axiosOpts
         );
         const choice = response.data?.choices?.[0];
         if (!choice) throw new Error(`${this.name}: no choices returned. Raw: ${JSON.stringify(response.data).slice(0, 200)}`);
@@ -114,10 +120,12 @@ export class CustomProvider implements AIProvider {
   async streamMessage(messages: Message[], tools: any[], onChunk: (text: string) => void, options: ProviderRequestOptions = {}): Promise<ProviderResponse> {
     return withProviderRetries(async () => {
       try {
+        const axiosOpts: any = { headers: this.getHeaders(), responseType: 'stream', timeout: 120_000 };
+        if (options.signal) axiosOpts.signal = options.signal;
         const response = await axios.post(
           this.getEndpoint(),
           this.buildPayload(messages, tools, true),
-          { headers: this.getHeaders(), responseType: 'stream', timeout: 120_000 }
+          axiosOpts
         );
 
         let fullText = '';
@@ -148,12 +156,13 @@ export class CustomProvider implements AIProvider {
         };
 
         for await (const raw of response.data) {
+          if (options.signal?.aborted) break;
           buffer += raw.toString();
           const lines = buffer.split('\n');
           buffer = lines.pop() ?? '';
           for (const line of lines) handleLine(line);
         }
-        if (buffer.trim().length > 0) handleLine(buffer);
+        if (buffer.trim().length > 0 && !options.signal?.aborted) handleLine(buffer);
 
         if (toolAccum.size > 0) {
           return {

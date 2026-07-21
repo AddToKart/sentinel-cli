@@ -38,7 +38,8 @@ export class GeminiProvider implements AIProvider {
     return withProviderRetries(async () => {
       const { model, history, lastMessage } = this.buildModel(messages, tools);
       const chat = model.startChat({ history });
-      const result = await chat.sendMessage(lastMessage.content);
+      const sendOpts: any = options.signal ? { signal: options.signal } : {};
+      const result = await chat.sendMessage(lastMessage.content, sendOpts);
       const response = await result.response;
       const calls = response.functionCalls();
       if (calls && calls.length > 0) {
@@ -55,10 +56,12 @@ export class GeminiProvider implements AIProvider {
     return withProviderRetries(async () => {
       const { model, history, lastMessage } = this.buildModel(messages, tools);
       const chat = model.startChat({ history });
-      const streamResult = await chat.sendMessageStream(lastMessage.content);
+      const sendOpts: any = options.signal ? { signal: options.signal } : {};
+      const streamResult = await chat.sendMessageStream(lastMessage.content, sendOpts);
 
       let fullText = '';
       for await (const chunk of streamResult.stream) {
+        if (options.signal?.aborted) break;
         const text = chunk.text();
         if (text) { onChunk(text); fullText += text; }
       }

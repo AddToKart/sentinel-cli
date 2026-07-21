@@ -3,6 +3,7 @@ import path from 'path';
 import { Style } from '../ui/theme.js';
 import { SYSTEM_PROMPT } from './system-prompt.js';
 import { buildGitContextBlock } from './git-context.js';
+import { buildMemoryContextBlock, initProjectMemory } from './persistent-memory.js';
 
 const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
 const RESIDUAL_SGR_RE = /\[[0-9;]*m/g;
@@ -157,7 +158,17 @@ export function composeSystemPrompt(projectContext: string, contextHeader: strin
   const gitBlock = buildGitContextBlock();
   const parts = [SYSTEM_PROMPT];
   if (projectContext) parts.push(`\n${contextHeader}\n${projectContext}`);
+
+  // Persistent memory block (cross-session project memories)
+  try {
+    const memoryBlock = buildMemoryContextBlock(8);
+    if (memoryBlock) parts.push(`\n${memoryBlock}`);
+  } catch { /* memory unavailable — skip */ }
+
   if (gitBlock) parts.push(`\n═══ GIT WORKSPACE ═══\n${gitBlock.replace('Git workspace snapshot (auto-detected):', '').trim()}`);
+
+  // Initialize persistent memory store (idempotent)
+  try { initProjectMemory(); } catch { /* skip */ }
 
   return parts.join('\n\n');
 }

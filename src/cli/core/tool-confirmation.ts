@@ -1,6 +1,7 @@
 import chalk from 'chalk';
 import readline from 'readline';
 import path from 'path';
+import os from 'os';
 import { Style, buildPanel } from '../ui/theme.js';
 
 // ─── Per-session "Always Allow" cache ────────────────────────────────────
@@ -10,6 +11,44 @@ const alwaysAllowKeys = new Set<string>();
 // When a directory is trusted, write_file and edit_file skip confirmation
 // for any path under that directory. execute_shell always prompts.
 let trustedDirectories = new Set<string>();
+
+// ─── Persistent Trusted Directory Store ──────────────────────────────────
+// Trusted directories are persisted to ~/.sentinel/trusted-dirs.json so
+// they survive CLI restarts. Loading/saving is transparent.
+const SENTINEL_DIR = path.join(os.homedir(), '.sentinel');
+const TRUSTED_DIRS_FILE = path.join(SENTINEL_DIR, 'trusted-dirs.json');
+
+function loadPersistentTrustedDirs(): void {
+  try {
+    if (!fs.existsSync(TRUSTED_DIRS_FILE)) return;
+    const raw = fs.readFileSync(TRUSTED_DIRS_FILE, 'utf-8');
+    const dirs: string[] = JSON.parse(raw);
+    if (Array.isArray(dirs)) {
+      for (const dir of dirs) {
+        if (typeof dir === 'string' && dir.length > 0) {
+          trustedDirectories.add(dir);
+        }
+      }
+    }
+  } catch {
+    // Corrupted file — silently ignore and start fresh
+  }
+}
+
+function savePersistentTrustedDirs(): void {
+  try {
+    if (!fs.existsSync(SENTINEL_DIR)) {
+      fs.mkdirSync(SENTINEL_DIR, { recursive: true });
+    }
+    const dirs = [...trustedDirectories];
+    fs.writeFileSync(TRUSTED_DIRS_FILE, JSON.stringify(dirs, null, 2), 'utf-8');
+  } catch {
+    // Best-effort save — no need to crash
+  }
+}
+
+// Load persisted trusted directories on module init
+loadPersistentTrustedDirs();
 
 const SAFE_TOOLS = new Set(['write_file', 'edit_file']);
 const TRUST_PREFIX = '__trusted_dir__:';
@@ -32,13 +71,16 @@ import { isPathSensitive } from '../../tools/index.js';
  */
 export function trustDirectory(dir: string): void {
   trustedDirectories.add(normalizeDir(dir));
+  savePersistentTrustedDirs();
 }
 
 /**
  * Remove trust from a directory.
  */
 export function untrustDirectory(dir: string): boolean {
-  return trustedDirectories.delete(normalizeDir(dir));
+  const result = trustedDirectories.delete(normalizeDir(dir));
+  if (result) savePersistentTrustedDirs();
+  return result;
 }
 
 /**
@@ -67,6 +109,7 @@ export function getTrustedDirectories(): string[] {
  */
 export function clearAllTrust(): void {
   trustedDirectories.clear();
+  savePersistentTrustedDirs();
 }
 
 /**

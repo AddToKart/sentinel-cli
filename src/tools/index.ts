@@ -158,6 +158,48 @@ export const SENSITIVE_FILE_PATTERNS: Array<{ pattern: RegExp; description: stri
   { pattern: /\\Windows\\/i, description: 'Windows directory' },
 ];
 
+// ─── Security — Path Traversal Detection ──────────────────────────────
+// Detects attempts to escape the working directory via ../, null bytes, or
+// other path manipulation techniques.
+const PATH_TRAVERSAL_PATTERNS = [
+  { pattern: /(?:^|[\/\\])\.\.(?:[\/\\]|$)/, description: 'directory traversal (..)' },
+  { pattern: /\0/, description: 'null byte injection' },
+  { pattern: /[\x00-\x08\x0B\x0C\x0E-\x1F]/, description: 'control character in path' },
+  { pattern: /^~/, description: 'home directory reference (~)' },
+  { pattern: /%00/, description: 'URL-encoded null byte' },
+  { pattern: /%2e%2e/i, description: 'URL-encoded directory traversal' },
+  // Deep traversal: more than 3 levels of ../../
+  { pattern: /(?:\.\.[\/\\]){3,}/, description: 'deep directory traversal' },
+  // Device paths on Windows
+  { pattern: /^\\\\\?\\/, description: 'Windows extended-length path prefix' },
+];
+
+export function isPathTraversal(filePath: string): { traversal: boolean; reason?: string } {
+  const normalized = filePath.replace(/\\/g, '/');
+  for (const { pattern, description } of PATH_TRAVERSAL_PATTERNS) {
+    if (pattern.test(normalized)) {
+      return { traversal: true, reason: description };
+    }
+  }
+  return { traversal: false };
+}
+
+// ─── Security — Dangerous File Extensions ─────────────────────────────
+// Files with these extensions should never be written by the AI agent.
+// They represent executable binaries, system libraries, or other dangerous types.
+const DANGEROUS_WRITE_EXTENSIONS = new Set([
+  '.exe', '.dll', '.so', '.dylib', '.bin', '.msi', '.msp', '.scr',
+  '.ps1', '.psm1', '.psd1', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.wsh',
+  '.com', '.bat', '.cmd', '.scr', '.pif', '.scf', '.lnk', '.inf',
+  '.reg', '.cer', '.crt', '.der', '.pem', '.pfx', '.p12',
+  '.docm', '.xlsm', '.pptm',
+]);
+
+export function isDangerousExtension(filePath: string): boolean {
+  const ext = path.extname(filePath).toLowerCase();
+  return DANGEROUS_WRITE_EXTENSIONS.has(ext);
+}
+
 // Helper to check if a path matches any sensitive pattern
 export function isPathSensitive(filePath: string): { sensitive: boolean; reason?: string } {
   const normalized = filePath.replace(/\\/g, '/');
@@ -565,6 +607,13 @@ export const readFileTool: ToolDefinition = {
   async execute({ path: filePath, offset, limit }) {
     try {
       const fullPath = resolvePath(filePath);
+
+      // Security: block path traversal attempts
+      const traverseCheck = isPathTraversal(filePath);
+      if (traverseCheck.traversal) {
+        return `⚠ Blocked by security policy: Path traversal detected (${traverseCheck.reason}) in "${filePath}".`;
+      }
+
       const sensitiveCheck = isPathSensitive(fullPath);
       if (sensitiveCheck.sensitive) {
         const allow = await promptSensitiveFileRead(filePath, sensitiveCheck.reason!);
@@ -610,6 +659,18 @@ export const writeFileTool: ToolDefinition = {
   async execute({ path: filePath, content }) {
     try {
       const fullPath = resolvePath(filePath);
+
+      // Security: block path traversal attempts
+      const traverseCheck = isPathTraversal(filePath);
+      if (traverseCheck.traversal) {
+        return `⚠ Blocked by security policy: Path traversal detected (${traverseCheck.reason}) in "${filePath}".`;
+      }
+
+      // Security: block dangerous file extensions
+      if (isDangerousExtension(filePath)) {
+        const ext = path.extname(filePath).toLowerCase();
+        return `⚠ Blocked by security policy: Writing ${ext} files is not allowed (${filePath}). This extension is blocked for security.`;
+      }
 
       // Security: block writes to sensitive paths
       const sensitiveCheck = isPathSensitive(fullPath);
@@ -665,6 +726,13 @@ export const editFileTool: ToolDefinition = {
   }) {
     try {
       const fullPath = resolvePath(filePath);
+
+      // Security: block path traversal attempts
+      const traverseCheck = isPathTraversal(filePath);
+      if (traverseCheck.traversal) {
+        return `⚠ Blocked by security policy: Path traversal detected (${traverseCheck.reason}) in "${filePath}".`;
+      }
+
       const sensitiveCheck = isPathSensitive(fullPath);
       if (sensitiveCheck.sensitive) return `Blocked: cannot edit ${sensitiveCheck.reason} (${filePath}).`;
       if (!fs.existsSync(fullPath)) return `File not found: ${filePath}`;
@@ -1190,6 +1258,43 @@ export const gitTool: ToolDefinition = {
   },
 };
 
+// ─── Delegate Task (Subagent) ─────────────────────────────────────────────────
+export const delegateTaskTool: ToolDefinition = {
+  name: 'delegate_task',
+  displayName: 'Delegating',
+  description: 'Spawn a read-only subagent to independently explore or research a specific question in the codebase. The subagent can grep, glob, read files, and list directories — then returns a structured summary. Use for tasks that require broad exploration without polluting your main conversation context.',
+  parameters: {
+    type: 'object',
+    properties: {
+      goal: { type: 'string', description: 'What the subagent should investigate (e.g. "Find all places where auth middleware is used")' },
+      context: { type: 'string', description: 'Background context to help the subagent understand the task' },
+      mode: { type: 'string', description: 'explore = brief file summary, research = deeper analysis (default: explore)' },
+      name: { type: 'string', description: 'Agent name (default: Codebase Explorer)' },
+    },
+    required: ['goal'],
+  },
+  requiresConfirmation: true,
+  getLabel: ({ goal, name }) => `${name || 'Codebase Explorer'}: ${String(goal).slice(0, 50)}`,
+  getRiskSummary: ({ goal, mode, name }) => `${name || 'Codebase Explorer'} (${mode || 'explore'}) — "${String(goal).slice(0, 70)}"`,
+  async execute({ goal, context = '', mode = 'explore', name = 'Codebase Explorer' }) {
+    // Dynamic import to avoid circular dependency at module load time
+    const { runAgent, createAgentProvider } = await import('../agent/index.js');
+    const { provider, config } = createAgentProvider();
+
+    const result = await runAgent(config, provider, {
+      name,
+      goal: String(goal),
+      context: String(context),
+      mode: mode === 'research' ? 'research' : 'explore',
+      parentCwd: process.cwd(),
+    });
+
+    const header = result.error ? `${name} completed with error` : `${name} complete`;
+    const stats = `${result.toolCallsMade} tool calls, ${result.filesExamined.length} files examined`;
+    return `${header} (${stats})\n\n${result.summary}`;
+  },
+};
+
 export const tools: ToolDefinition[] = [
   shellTool,
   readFileTool,
@@ -1202,4 +1307,5 @@ export const tools: ToolDefinition[] = [
   readCodebaseTool,
   askUserTool,
   gitTool,
+  delegateTaskTool,
 ];

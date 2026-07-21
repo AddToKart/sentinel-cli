@@ -17,6 +17,7 @@ export interface ProviderResponse {
 
 export interface ProviderRequestOptions {
   maxRetries?: number;
+  signal?: AbortSignal;
 }
 
 export interface AIProvider {

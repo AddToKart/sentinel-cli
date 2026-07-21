@@ -55,6 +55,10 @@ export class OpenRouterProvider implements AIProvider {
   }
 
   private wrapError(error: any): never {
+    if (axios.isCancel(error)) {
+      // Request was aborted via signal — re-throw so upstream can handle as cancelled
+      throw error;
+    }
     if (error.response) {
       const data = error.response.data;
       const msg = data?.error?.message || JSON.stringify(data);
@@ -67,10 +71,12 @@ export class OpenRouterProvider implements AIProvider {
   async sendMessage(messages: Message[], tools?: any[], options: ProviderRequestOptions = {}): Promise<ProviderResponse> {
     return withProviderRetries(async () => {
       try {
+        const axiosOpts: any = { headers: this.getHeaders() };
+        if (options.signal) axiosOpts.signal = options.signal;
         const response = await axios.post(
           'https://openrouter.ai/api/v1/chat/completions',
           this.buildPayload(messages, tools, false),
-          { headers: this.getHeaders() }
+          axiosOpts
         );
 
         const choice = response.data?.choices?.[0];
@@ -88,13 +94,15 @@ export class OpenRouterProvider implements AIProvider {
   async streamMessage(messages: Message[], tools: any[], onChunk: (text: string) => void, options: ProviderRequestOptions = {}): Promise<ProviderResponse> {
     return withProviderRetries(async () => {
       try {
+        const axiosOpts: any = {
+          headers: this.getHeaders(),
+          responseType: 'stream',
+        };
+        if (options.signal) axiosOpts.signal = options.signal;
         const response = await axios.post(
           'https://openrouter.ai/api/v1/chat/completions',
           this.buildPayload(messages, tools, true),
-          {
-            headers: this.getHeaders(),
-            responseType: 'stream',
-          }
+          axiosOpts
         );
 
         let fullText = '';
@@ -136,6 +144,7 @@ export class OpenRouterProvider implements AIProvider {
         };
 
         for await (const raw of response.data) {
+          if (options.signal?.aborted) break;
           buffer += raw.toString();
           const lines = buffer.split('\n');
           buffer = lines.pop() ?? '';
@@ -146,7 +155,7 @@ export class OpenRouterProvider implements AIProvider {
         }
 
         // Some providers may end without a trailing newline; parse remaining buffered line.
-        if (buffer.trim().length > 0) {
+        if (buffer.trim().length > 0 && !options.signal?.aborted) {
           handleDataLine(buffer);
         }
 

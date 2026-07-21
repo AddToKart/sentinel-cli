@@ -48,7 +48,10 @@ export function createTurnInterruptController(): TurnInterruptController {
 
       const taskPromise: Promise<ValueToken<T> | ErrorToken> = task()
         .then((value): ValueToken<T> => ({ kind: 'value', value }))
-        .catch((error): ErrorToken => ({ kind: 'error', error }));
+        .catch((error): ErrorToken => {
+          // AbortError / CanceledError: race already resolved, caller treats as cancelled
+          return { kind: 'error', error };
+        });
 
       let cancel!: () => void;
       const cancelPromise = new Promise<CancelToken>((resolve) => {

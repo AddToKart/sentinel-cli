@@ -25,6 +25,7 @@ import { setSandboxEnabled, isSandboxEnabled, resetSandboxApprovals } from './co
 import { undoLastFileOp, getUndoCount, getLastUndoLabel } from './core/undo.js';
 import { startAutoSave, stopAutoSave, isFreshInstall } from './core/session-store.js';
 import { getCostSummary } from './core/tracker.js';
+import { remember, forget, listMemories, getMemoryStats, MemoryType } from './core/persistent-memory.js';
 
 export const program = new Command();
 
@@ -514,6 +515,10 @@ function showHelp() {
     `${Style.accent('/load')}      ${Style.body('Load a saved session')}`,
     `${Style.accent('/config')}    ${Style.body('View/set model parameters')}`,
     `${Style.accent('/init')}      ${Style.body('Generate a SENTINEL.md project file')}`,
+    `${Style.accent('/remember')}  ${Style.body('Save a persistent memory (fact|preference|pattern|lesson|user_note)')}`,
+    `${Style.accent('/forget')}    ${Style.body('Remove a persistent memory by ID')}`,
+    `${Style.accent('/memories')}  ${Style.body('List all persistent project memories')}`,
+    `${Style.accent('/research')}  ${Style.body('Spawn a subagent to investigate the codebase')}`,
     `${Style.accent('/update')}    ${Style.body('Check for and install updates')}`,
     `${Style.accent('/clear')}     ${Style.body('Clear conversation history')}`,
     `${Style.accent('/exit')}      ${Style.body('Close Sentinel')}`,
@@ -695,6 +700,124 @@ async function handleSlashCommand(trimmedInput: string, state: {
 
   if (command === '/update') {
     await performUpdate();
+    return { handled: true, currentProvider, currentModel, planningMode, messages };
+  }
+
+  if (command === '/remember') {
+    const memoryType = (parts[1] ?? '').toLowerCase() as MemoryType;
+    const validTypes: MemoryType[] = ['fact', 'preference', 'pattern', 'lesson', 'user_note'];
+    if (!validTypes.includes(memoryType)) {
+      process.stdout.write(`${Style.dim(` Usage: /remember <type> <content>`)}\n`);
+      process.stdout.write(`${Style.dim(` Types: ${validTypes.join(', ')}`)}\n\n`);
+      return { handled: true, currentProvider, currentModel, planningMode, messages };
+    }
+    const content = parts.slice(2).join(' ').trim();
+    if (!content) {
+      process.stdout.write(`${Style.error(' ✖')} Provide content to remember.\n\n`);
+      return { handled: true, currentProvider, currentModel, planningMode, messages };
+    }
+    const id = remember(memoryType, content, 'user:/remember');
+    if (id) {
+      process.stdout.write(`${Style.success(' ✔')} ${Style.accent(memoryType)} memory saved ${Style.dim(`(${id.slice(0, 16)}...)`)}\n\n`);
+    } else {
+      process.stdout.write(`${Style.dim(' ⓘ Memory already exists (skipped duplicate).\n\n')}`);
+    }
+    return { handled: true, currentProvider, currentModel, planningMode, messages };
+  }
+
+  if (command === '/forget') {
+    const memoryId = parts.slice(1).join(' ').trim();
+    if (!memoryId) {
+      process.stdout.write(`${Style.dim(' Usage: /forget <memory-id>')}\n`);
+      process.stdout.write(`${Style.dim(' Use /memories to see IDs.\n\n')}`);
+      return { handled: true, currentProvider, currentModel, planningMode, messages };
+    }
+    if (forget(memoryId)) {
+      process.stdout.write(`${Style.success(' ✔')} Memory forgotten.\n\n`);
+    } else {
+      process.stdout.write(`${Style.error(' ✖')} Memory not found: ${memoryId}\n\n`);
+    }
+    return { handled: true, currentProvider, currentModel, planningMode, messages };
+  }
+
+  if (command === '/memories') {
+    const typeFilter = (parts[1] ?? '').toLowerCase() as MemoryType;
+    const validTypes: MemoryType[] = ['fact', 'preference', 'pattern', 'lesson', 'user_note'];
+    const filter = validTypes.includes(typeFilter) ? [typeFilter] : undefined;
+    const memories = listMemories(filter);
+    const stats = getMemoryStats();
+
+    if (memories.length === 0) {
+      process.stdout.write(`${Style.dim(' No memories yet. Use /remember to add one, or they will be auto-extracted as you work.\n\n')}`);
+      return { handled: true, currentProvider, currentModel, planningMode, messages };
+    }
+
+    const typeCounts = Object.entries(stats.types).filter(([_, c]) => c > 0).map(([t, c]) => `${t}:${c}`).join('  ');
+    const items: string[] = [
+      `${Style.dim('Total:')} ${Style.accent(String(stats.count))}  ${Style.dim(typeCounts)}`,
+      '',
+    ];
+    for (const m of memories) {
+      const icon = m.type === 'fact' ? '📌' : m.type === 'preference' ? '⭐' : m.type === 'pattern' ? '🔄' : m.type === 'lesson' ? '💡' : '📝';
+      const age = new Date(m.updatedAt).toLocaleDateString();
+      items.push(`  ${icon} ${Style.accent(m.id.slice(0, 12))}${Style.dim(` [${m.type}]`)} ${m.content.slice(0, 120)}`);
+      items.push(`    ${Style.dim(`source: ${m.source.slice(0, 50)} · ${age}`)}`);
+    }
+    const body = buildPanel('Persistent Project Memories', items);
+    for (const l of body) process.stdout.write(`  ${l}\n`);
+    process.stdout.write(`  ${Style.dim('Use')} ${Style.accent('/remember <type> <text>')} ${Style.dim('to add,')} ${Style.accent('/forget <id>')} ${Style.dim('to remove.\n\n')}`);
+    return { handled: true, currentProvider, currentModel, planningMode, messages };
+  }
+
+  if (command === '/research') {
+    const question = parts.slice(1).join(' ').trim();
+    if (!question) {
+      process.stdout.write(`${Style.dim(' Usage: /research <question or task for codebase investigation>')}\n\n`);
+      return { handled: true, currentProvider, currentModel, planningMode, messages };
+    }
+
+    process.stdout.write(`\n${Style.icon('◈')} ${Style.header('Research Subagent')} — investigating: ${Style.body(question)}\n`);
+    process.stdout.write(Style.dim(' Spawning read-only explorer...\n\n'));
+
+    try {
+      const { runAgent, createAgentProvider } = await import('../agent/index.js');
+      const { provider, config } = createAgentProvider();
+
+      const maxWaitMs = 120_000;
+      const result = await Promise.race([
+        runAgent(config, provider, {
+          name: 'Research Agent',
+          goal: question,
+          context: `The parent agent is running in ${process.cwd()}. Current provider: ${currentProvider}, model: ${currentModel}`,
+          mode: 'research',
+          parentCwd: process.cwd(),
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Research timed out after 120s')), maxWaitMs)
+        ),
+      ]);
+
+      process.stdout.write(`\n${Style.success(' ─')} ${Style.header('Research Complete')}${Style.dim(` (${result.toolCallsMade} tool calls, ${result.filesExamined.length} files)`)}\n\n`);
+
+      if (result.error) {
+        process.stdout.write(`${Style.warning(' ⚠')} Research encountered an error: ${Style.body(result.error)}\n\n`);
+      }
+
+      // Print the summary
+      process.stdout.write(result.summary + '\n\n');
+
+      // Auto-save findings as a memory if substantial
+      const summaryPreview = result.summary.slice(0, 300).trim();
+      if (summaryPreview.length > 50 && result.toolCallsMade > 2) {
+        const id = remember('lesson', summaryPreview, `auto:research:${question.slice(0, 60)}`);
+        if (id) {
+          process.stdout.write(Style.dim(` 💾 Key findings auto-saved as memory.\n\n`));
+        }
+      }
+    } catch (err: any) {
+      process.stdout.write(`${Style.error(' ✖')} Research failed: ${Style.body(err.message)}\n\n`);
+    }
+
     return { handled: true, currentProvider, currentModel, planningMode, messages };
   }
 

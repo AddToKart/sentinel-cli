@@ -285,7 +285,7 @@ async function requestAssistantResponse(
             streamStarted = true;
           }
           io.pushAssistantChunk(chunk);
-        }, { maxRetries: 2 })
+        }, { maxRetries: 2, signal: interrupt.getSignal() })
       );
       if (!streamStarted) stopThinking();
       io.endAssistantStream();
@@ -300,7 +300,7 @@ async function requestAssistantResponse(
     if (!response && streamFailed) {
       const stopFallback = io.startSpinner('Thinking...');
       try {
-        const fallback = await interrupt.run(() => provider.sendMessage(messages, tools, { maxRetries: 2 }));
+        const fallback = await interrupt.run(() => provider.sendMessage(messages, tools, { maxRetries: 2, signal: interrupt.getSignal() }));
         stopFallback();
         if (fallback.cancelled) return { cancelled: true, streamed };
         response = fallback.value;
@@ -309,7 +309,7 @@ async function requestAssistantResponse(
   } else {
     const stop = io.startSpinner('Working on it...');
     try {
-      const result = await interrupt.run(() => provider.sendMessage(messages, tools, { maxRetries: 2 }));
+      const result = await interrupt.run(() => provider.sendMessage(messages, tools, { maxRetries: 2, signal: interrupt.getSignal() }));
       stop();
       if (result.cancelled) return { cancelled: true, streamed };
       response = result.value;
@@ -321,7 +321,7 @@ async function requestAssistantResponse(
   if (isEmptyAssistantResponse(response)) {
     const stopRetry = io.startSpinner('Retrying...');
     try {
-      const retry = await interrupt.run(() => provider.sendMessage(messages, tools, { maxRetries: 1 }));
+      const retry = await interrupt.run(() => provider.sendMessage(messages, tools, { maxRetries: 1, signal: interrupt.getSignal() }));
       stopRetry();
       if (retry.cancelled) return { cancelled: true, streamed };
       if (!isEmptyAssistantResponse(retry.value)) response = retry.value;
